@@ -1,0 +1,208 @@
+bonelab wallrun idea
+
+
+A on right conrtoller
+
+
+run along a wall, hold A while airborn next to wall, feet try to procedural IK animated to walk the feet along the wall with feet flat or slanted against wall
+
+letting go of A lets you drop off the wall.
+
+
+Holding A to wall run, let go then tap A right after letting go to jump from/off the wall pushing you slightly up and away from the wall.
+
+
+
+|
+
+When you jump toward a wall, continuing to hold A to stick and run, then tapping A to kick off, feels as natural as Titanfall or Ghostrunner.
+Here is the complete gameplay breakdown and the ready-to-use blueprint to hand to your AI agent.
+How Wallrunning Works in PayneLab
+code
+Code
+[SPRINT / SLIDE-JUMP INTO AIR]
+              │
+              │  (Hold 'A' while airborne within 0.8m of a vertical wall)
+              ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │ STATE: WallRun (Left or Right Wall)                     │
+   │ 1. Vector Projection: Snap velocity to wall tangent     │
+   │ 2. Gravity Dampener: Float with gentle downward glide   │
+   │ 3. Torso Lean: Bank body ~15°-20° away from wall        │
+   │ 4. Procedural Leg Stride: Wall-side leg cycles steps    │
+   │    flat against wall plane, air-side leg balances       │
+   └────────────────────────────┬────────────────────────────┘
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        │                                               │
+ (Release 'A')                                    (Tap 'A' to Kick Off)
+        │                                               │
+        ▼                                               ▼
+ [Drop Off Wall]                              [Wall Jump Slingshot]
+ Fall naturally with                          Impulse: Up + Outward Normal
+ preserved forward momentum                   + Forward Momentum Carry
+The Physics & Kinematic Mechanics
+Smart Wall Detection (Lateral Ray Probes):
+Two short horizontal raycasts probe Left and Right from the pelvis (
+0.8
+m
+0.8m
+).
+Checks if surface is actually a wall (
+∣
+Normal
+⋅
+Vector3.up
+∣
+<
+0.2
+∣Normal⋅Vector3.up∣<0.2
+) and that the player is airborne.
+Calculates the Wall Tangent Vector (
+v
+⃗
+tangent
+v
+  
+tangent
+​
+ 
+) parallel to the wall based on your incoming flight path.
+The "Anti-Gravity" Glide & Wall Clamp:
+While holding A, counter 85% of gravity so you glide horizontally across the surface with just a subtle cinematic downward drop.
+Apply a tiny inward clamping force (
+−
+normal
+⃗
+×
+20
+N
+− 
+normal
+ ×20N
+) to keep you glued to the wall surface until you let go.
+Procedural Leg Running (Walking Along the Wall):
+Wall-Side Leg: Extends laterally towards the wall surface. Its hip and knee cycle in a sine-wave stride pattern (
+sin
+⁡
+(
+time
+×
+speed
+)
+sin(time×speed)
+) to simulate physical footsteps running along the wall face.
+Air-Side Leg: Bends slightly at the knee to act as an aerodynamic counterweight.
+Torso Bank: The pelvis/spine tilts outward by 
+15
+∘
+15 
+∘
+ 
+ (banking), exactly like Titanfall or Mirror's Edge.
+Wall Jump / Rebound Kick:
+Letting go of A cleanly drops you off the wall with zero friction.
+Tapping A while on the wall (or within a 
+0.2
+s
+0.2s
+ release grace window) triggers a Wall Jump:
+F
+⃗
+jump
+=
+(
+WallNormal
+⃗
+×
+5.0
+)
++
+(
+Vector3.up
+×
+5.5
+)
++
+(
+v
+⃗
+tangent
+×
+3.0
+)
+F
+  
+jump
+​
+ =( 
+WallNormal
+ ×5.0)+(Vector3.up×5.5)+( 
+v
+  
+tangent
+​
+ ×3.0)
+Launches you up, away from the wall, and forward, transitioning straight into Aerial where you can immediately initiate mid-air flips or 360 trickshots!
+Prompt to Send to Your AI Agent
+Copy and paste this directive directly to your agent to build the Wallrun system:
+code
+Markdown
+# TASK: Implement Procedural Wallrunning & Wall-Jump System (PayneLab)
+
+Implement a full active-ragdoll Wallrunning and Wall-Jump mechanic mapped to the Right Controller 'A' button (Jump hold).
+
+### 1. State Machine & Enum Update
+* In `PayneLab.cs`, add `StuntState.WallRun` to `enum StuntState`.
+* In `PayneLabStateMachine.cs`:
+  - Add fields:
+    - `private bool _isWallRunning = false;`
+    - `private Vector3 _wallNormal = Vector3.zero;`
+    - `private bool _isWallOnRight = false;`
+    - `private float _wallRunTimer = 0f;`
+    - `private float _wallReleaseGraceTimer = 0f;`
+  - Detection Logic in `Tick()` / `DetectMovementState()`:
+    - When `_mod.CurrentState == StuntState.Aerial` and player is NOT grounded:
+      - Fire two lateral raycasts from `CachedPelvisRb.position` (Left: `-transform.right * 0.9f`, Right: `transform.right * 0.9f`) using `PayneLabUtils.RaycastNonSelf`.
+      - Check if wall hit is vertical (`Mathf.Abs(hit.normal.y) < 0.25f`).
+      - If wall is found AND Right Controller 'A' is held (`rCtrl.GetAButton()`):
+        - Enter `StuntState.WallRun`.
+        - Capture `_wallNormal = hit.normal;` and determine `_isWallOnRight = (hit.point - pelvis.pos)` dot `transform.right > 0`.
+  - Wallrun Physics Loop:
+    - While in `StuntState.WallRun`:
+      - If player releases 'A' (`!rCtrl.GetAButton()`) or reaches max wallrun time (`2.5s`) or loses wall contact:
+        - Exit `WallRun` to `StuntState.Aerial`.
+        - Start `_wallReleaseGraceTimer = 0.20f;` (allows jump-buffering after release).
+      - If player presses 'A' down (`rCtrl.GetAButtonDown()`) while in `WallRun` or during the grace window:
+        - Trigger `ExecuteWallJump()`.
+  - Physics Forces in `WallRun`:
+    - Calculate wall forward tangent: `Vector3 tangent = Vector3.Cross(_wallNormal, Vector3.up);` (ensure tangent aligns with player forward velocity via Dot product).
+    - Counter gravity: Apply upward force `Vector3.up * 8.5f` (ForceMode.Acceleration) to slow descent.
+    - Maintain forward momentum along `tangent` (`tangent * speed`).
+    - Apply slight inward stick force (`-_wallNormal * 15f`, ForceMode.Acceleration).
+
+### 2. Wall Jump Execution
+* Method `ExecuteWallJump()`:
+  - Calculate rebound impulse:
+    `Vector3 jumpDir = (_wallNormal * 4.5f) + (Vector3.up * 5.2f) + (tangent * 3.0f);`
+  - Apply `CachedPelvisRb.AddForce(jumpDir, ForceMode.VelocityChange);`
+  - Set state to `StuntState.Aerial`.
+  - Set `_actionLockTimer = 0.3f;` to prevent instant re-sticking.
+
+### 3. Procedural Leg Stride & Torso Bank (`PayneLabLegPoses.cs`)
+* In `ComputeWallRunPose()`:
+  - Calculate run cycle: `float stride = Mathf.Sin(Time.time * 12f) * 35f;`
+  - If `_isWallOnRight`:
+    - **Right Leg (Wall-Side):** `RightHipTarget = Quaternion.Euler(stride, 25f, -15f); RightKneeTarget = Quaternion.Euler(45f + stride * 0.5f, 0f, 0f);`
+    - **Left Leg (Air-Side):** `LeftHipTarget = Quaternion.Euler(-stride * 0.5f, -10f, 0f); LeftKneeTarget = Quaternion.Euler(30f, 0f, 0f);`
+  - If `_isWallOnLeft`:
+    - Mirror the poses for Left as Wall-Side and Right as Air-Side.
+* In `PayneLabStabilizer.cs`:
+  - When in `StuntState.WallRun`, tilt target up vector by 15° away from the wall normal to create the dynamic body bank/lean.
+
+### 4. BoneMenu Additions (`PayneLab.cs`)
+* `Wallrun Gravity Scale` (float, default: 0.15f)
+* `Wall Jump Force` (float, default: 5.0f)
+* `Wallrun Max Duration` (float, default: 2.5f)
+
+Compile clean against `#1_Bonelab_Melon_References` with 0 errors and 0 warnings.

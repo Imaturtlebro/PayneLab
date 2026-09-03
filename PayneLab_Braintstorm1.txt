@@ -1,0 +1,1457 @@
+
+Model 1:56 PM
+Here is a comprehensive technical audit, gameplay feature brainstorm, and complete set of refactored patches for PayneLab. You can copy-paste this entire brief directly to your AI agent.
+PayneLab: Architecture Audit, Physics Fixes & Feature Blueprint
+1. CRITICAL RUNTIME BUGS & PHYSICS AUDIT
+While the mod compiles cleanly, several critical physics, memory, and state-machine bugs will cause jitter, state fighting, or physics explosions in-game.
+Bug 1 : Drive Spring Overwrite Conflict (PayneLabLegPoses vs PayneLabJointControl)
+The Issue: PayneLabJointControl.ApplyStateDriveParams() computes specific spring/damper parameters for each state (e.g. 1200f for Cannonball, 150f for DiveProne). However, PayneLabLegPoses.ApplyJointTarget() runs every single FixedUpdate and hard-overwrites drive.positionSpring = 500f, completely wiping out JointControl's per-state tuning.
+The Fix: Remove drive configuration from LegPoses. Let JointControl manage spring/damper stiffness on state change, and let LegPoses only update joint.targetRotation.
+Bug 2 : Physics Explosions via ForceMode.Impulse in FixedUpdate
+The Issue: In PayneLabJointControl.cs, ApplyAerialTorque() and ApplyGroundRollTorque() call:
+code
+C#
+rb.AddRelativeTorque(torque, ForceMode.Impulse);
+FixedUpdate runs at 50Hz–90Hz. Applying an Impulse (instant momentum change) every single physics tick multiplies the applied torque by 50x–90x per second, instantly launching the player into orbital hyper-spin.
+The Fix: Switch to ForceMode.Acceleration (or ForceMode.Force) so the torque is smoothly integrated over time, scaled properly by stick magnitude.
+Bug 3 : Faulty Damping Math in PayneLabStabilizer.cs
+The Issue: The PD spring formula calculates damping as:
+code
+C#
+float angularVel = spine.angularVelocity.magnitude;
+float torqueMag = (kp * angle * Mathf.Deg2Rad) - (kd * angularVel);
+angularVelocity.magnitude is always positive. If the player is falling away from upright, subtracting kd * magnitude actually reduces the uprighting torque when it should be resisting the fall. Damping must be projected onto the correction axis:
+code
+C#
+float angularVelOnAxis = Vector3.Dot(spine.angularVelocity, correctionAxis);
+float torqueMag = (kp * angle * Mathf.Deg2Rad) - (kd * angularVelOnAxis);
+Bug 4 : Garbage Collection Spikes from GetComponentsInChildren
+The Issue: PayneLabLegPoses.ApplyPoseToJoints() calls:
+code
+C#
+var joints = rig.GetComponentsInChildren<ConfigurableJoint>();
+Calling this every FixedUpdate allocates arrays and queries the Unity hierarchy 90 times per second, causing severe micro-stutter / frame drops in VR.
+The Fix: Cache hip and knee joint references once when the rig is initialized/cached.
+Bug 5 : Stale Rig References on Avatar Swap
+The Issue: PayneLab.cs only invalidates the cache on OnSceneWasLoaded. When a player switches avatars via the radial menu, the old PhysicsRig transforms and rigidbodies become invalid or destroyed, breaking the mod until level reload.
+The Fix: Detect avatar changes via Player.RigManager.avatar or hook BoneLib.Hooking.OnSwitchAvatar to call InvalidateCache().
+Bug 6 : State Machine Falling Out of Transient States
+The Issue: WantDive and WantGroundRoll set the state for one frame, but on the very next FixedUpdate, DetectGroundState() immediately evaluates speed/height and forces the player back into Standing or Aerial before the physical dive/roll has begun.
+The Fix: Add a state lock timer / cooldown for transient action states (DiveProne, GroundRoll, Kick).
+2. GAMEPLAY & "GUN-FU" FEATURE BRAINSTORMING
+A. Contextual Bullet-Time / Auto-Slowmo Trigger
+The Idea: Max Payne's Shootdodge feels incredible because time slows down the moment you commit to a stunt.
+Implementation: When entering DiveProne, Aerial (during an active RS flip), or Kick, ramp Marrow's time scale down to 0.2x for up to 1.5 seconds or until player contact with ground. Ramp smoothly back to 1.0x upon landing or recovering to Standing.
+B. Dynamic NPC Collision & Stunt Takedowns (Bowling Pins)
+The Idea: Sliding into an enemy's ankles or kicking them mid-dive should send them flying.
+Implementation: During KneeSlide, DiveProne, or Kick, add an OnCollisionEnter trigger on the feet/pelvis rigidbodies that checks for Marrow PuppetMaster / AIBrain / NPC limbs. If hit while stunt-sliding, apply a heavy physics impulse to the enemy's legs to trip/ragdoll them immediately.
+C. Slide-Jump Boost (Titanfall / Apex Style Bunny-Hop)
+The Idea: Pressing Jump while in KneeSlide or ButtSlide converts sliding friction into a forward kinetic slingshot.
+Implementation: If jump is pressed while in a slide state, add forward momentum (AddForce(fwd * boostSpeed, ForceMode.VelocityChange)) and transition directly to Aerial.
+D. Wall-Plant / Parkour Rebound
+The Idea: If airborne or diving near a wall, kicking or pushing away from the wall lets you wall-jump.
+Implementation: Fire lateral raycasts (left, right, back). If a wall is within 0.8m while airborne, tapping Jump or Click applies an outward normal impulse (wallHit.normal * jumpForce + Vector3.up * vertForce).
+E. Tactical Arm Bracing in Prone / Slide
+The Idea: When lying on your side or sliding on your butt, your off-hand can brace against the ground to steady your primary weapon.
+Implementation: Allow the non-dominant hand to act as a physical pivot/anchor if it touches ground geometry, keeping your aim rock-steady with your firing hand.
+3. READY-TO-USE CODE REFACTOR
+Here are the updated, drop-in replacement files fixing the bugs and implementing the polish passes.
+PayneLabStabilizer.cs
+code
+C#
+using UnityEngine;
+using Il2CppSLZ.Marrow;
+
+namespace PayneLab
+{
+    public class PayneLabStabilizer
+    {
+        private readonly PayneLabMod _mod;
+
+        public PayneLabStabilizer(PayneLabMod mod) { _mod = mod; }
+
+        public void Tick()
+        {
+            // Stabilizer only active when not in full ragdoll
+            if (_mod.ActiveInput == InputMode.FullRagdoll) return;
+
+            // Don't fight hard during inverted / action states
+            if (_mod.CurrentState == StuntState.Cannonball) return;
+            if (_mod.CurrentState == StuntState.Kick) return;
+            if (_mod.CurrentState == StuntState.GroundRoll) return;
+
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            Rigidbody spine = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (spine == null) return;
+
+            Vector3 spineUp = spine.transform.up;
+            Vector3 targetUp = Vector3.up;
+
+            // Compute angle error
+            Vector3 correctionAxis = Vector3.Cross(spineUp, targetUp);
+            float sinAngle = correctionAxis.magnitude;
+            float cosAngle = Vector3.Dot(spineUp, targetUp);
+            float angle = Mathf.Atan2(sinAngle, cosAngle) * Mathf.Rad2Deg;
+
+            if (sinAngle > 0.001f)
+            {
+                correctionAxis.Normalize();
+            }
+            else
+            {
+                // Already upright or inverted
+                if (cosAngle < 0f) correctionAxis = spine.transform.right; // Upside down fallback
+                else return; // Perfectly aligned
+            }
+
+            float stateScale = GetStateStiffnessScale();
+            float kp = _mod.StabilizerSpring * stateScale;
+            float kd = _mod.StabilizerDamping * stateScale;
+
+            // Project current angular velocity onto correction axis for true PD damping
+            float angularVelOnAxis = Vector3.Dot(spine.angularVelocity, correctionAxis);
+
+            // Torque = Kp * error - Kd * velocity_on_axis
+            float torqueMag = (kp * angle * Mathf.Deg2Rad) - (kd * angularVelOnAxis);
+            torqueMag = Mathf.Clamp(torqueMag, -_mod.StabilizerMaxTorque, _mod.StabilizerMaxTorque);
+
+            if (Mathf.Abs(torqueMag) > 0.01f)
+            {
+                spine.AddTorque(correctionAxis * torqueMag, ForceMode.Acceleration);
+            }
+        }
+
+        private float GetStateStiffnessScale()
+        {
+            switch (_mod.CurrentState)
+            {
+                case StuntState.Standing:
+                    return 1.0f;
+                case StuntState.KneeSlide:
+                case StuntState.ButtSlide:
+                    return 0.5f;
+                case StuntState.SideLying:
+                    return 0.3f;
+                case StuntState.DiveProne:
+                    return 0.2f;
+                case StuntState.Aerial:
+                    return 0.4f;
+                case StuntState.GroundRoll:
+                case StuntState.Cannonball:
+                    return 0.0f;
+                case StuntState.Kick:
+                    return 0.1f;
+                default:
+                    return 1.0f;
+            }
+        }
+    }
+}
+PayneLabJointControl.cs
+code
+C#
+using UnityEngine;
+using Il2CppSLZ.Marrow;
+using System.Collections.Generic;
+
+namespace PayneLab
+{
+    public class PayneLabJointControl
+    {
+        private readonly PayneLabMod _mod;
+
+        internal ConfigurableJoint[] HipJoints;
+        internal ConfigurableJoint[] KneeJoints;
+        private bool _drivesCached;
+
+        public PayneLabJointControl(PayneLabMod mod) { _mod = mod; }
+
+        public void InvalidateCache()
+        {
+            _drivesCached = false;
+            HipJoints = null;
+            KneeJoints = null;
+        }
+
+        public void OnStateChanged(StuntState from, StuntState to)
+        {
+            if (!_drivesCached)
+                CacheJointDrives();
+
+            ApplyStateDriveParams(to);
+        }
+
+        public void Tick()
+        {
+            if (_mod.ActiveInput == InputMode.FullRagdoll) return;
+
+            // Aerial flip torque via right stick
+            if (_mod.CurrentState == StuntState.Aerial || _mod.CurrentState == StuntState.Cannonball)
+            {
+                ApplyAerialTorque();
+            }
+
+            // Ground roll torque via left stick
+            if (_mod.CurrentState == StuntState.GroundRoll ||
+                _mod.CurrentState == StuntState.KneeSlide ||
+                _mod.CurrentState == StuntState.ButtSlide ||
+                _mod.CurrentState == StuntState.SideLying)
+            {
+                ApplyGroundRollTorque();
+            }
+        }
+
+        private void ApplyAerialTorque()
+        {
+            var rb = _mod.CachedPelvisRb;
+            if (rb == null) return;
+
+            Vector2 rs = _mod.Input.RightStick;
+
+            // Pitch (forward/back) and Roll (left/right)
+            Vector3 torque = new Vector3(
+                -rs.y * _mod.AerialFlipTorque * 50f,
+                0f,
+                -rs.x * _mod.AerialFlipTorque * 50f
+            );
+
+            if (torque.sqrMagnitude > 0.01f)
+            {
+                rb.AddRelativeTorque(torque, ForceMode.Acceleration);
+            }
+        }
+
+        private void ApplyGroundRollTorque()
+        {
+            var rb = _mod.CachedPelvisRb;
+            if (rb == null) return;
+
+            Vector2 ls = _mod.Input.LeftStick;
+
+            // LS X = barrel roll along body forward axis
+            Vector3 torque = Vector3.forward * (-ls.x * _mod.GroundRollTorque * 50f);
+
+            if (Mathf.Abs(ls.x) > 0.1f)
+            {
+                rb.AddRelativeTorque(torque, ForceMode.Acceleration);
+            }
+        }
+
+        public void CacheJointDrives()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            HipJoints = GetJointsByName(rig, "hip", "thigh", "leg");
+            KneeJoints = GetJointsByName(rig, "knee", "calf", "shin");
+
+            _drivesCached = true;
+        }
+
+        public void ApplyStateDriveParams(StuntState state)
+        {
+            if (!_drivesCached) CacheJointDrives();
+
+            float hipSpring, hipDamper, hipMaxForce;
+            float kneeSpring, kneeDamper, kneeMaxForce;
+
+            switch (state)
+            {
+                case StuntState.Standing:
+                    hipSpring = 800f; hipDamper = 80f; hipMaxForce = 1500f;
+                    kneeSpring = 600f; kneeDamper = 60f; kneeMaxForce = 1200f;
+                    break;
+                case StuntState.KneeSlide:
+                    hipSpring = 400f; hipDamper = 80f; hipMaxForce = 800f;
+                    kneeSpring = 700f; kneeDamper = 100f; kneeMaxForce = 1400f;
+                    break;
+                case StuntState.ButtSlide:
+                    hipSpring = 350f; hipDamper = 60f; hipMaxForce = 700f;
+                    kneeSpring = 300f; kneeDamper = 50f; kneeMaxForce = 600f;
+                    break;
+                case StuntState.Cannonball:
+                    hipSpring = 1500f; hipDamper = 120f; hipMaxForce = 3000f;
+                    kneeSpring = 1400f; kneeDamper = 100f; kneeMaxForce = 2800f;
+                    break;
+                case StuntState.SideLying:
+                    hipSpring = 500f; hipDamper = 60f; hipMaxForce = 1000f;
+                    kneeSpring = 400f; kneeDamper = 50f; kneeMaxForce = 800f;
+                    break;
+                case StuntState.DiveProne:
+                    hipSpring = 200f; hipDamper = 40f; hipMaxForce = 400f;
+                    kneeSpring = 150f; kneeDamper = 30f; kneeMaxForce = 300f;
+                    break;
+                case StuntState.GroundRoll:
+                    hipSpring = 1000f; hipDamper = 90f; hipMaxForce = 2000f;
+                    kneeSpring = 900f; kneeDamper = 80f; kneeMaxForce = 1800f;
+                    break;
+                case StuntState.Aerial:
+                    hipSpring = 600f; hipDamper = 60f; hipMaxForce = 1200f;
+                    kneeSpring = 500f; kneeDamper = 50f; kneeMaxForce = 1000f;
+                    break;
+                case StuntState.Kick:
+                    hipSpring = 1200f; hipDamper = 80f; hipMaxForce = 2500f;
+                    kneeSpring = 1000f; kneeDamper = 70f; kneeMaxForce = 2000f;
+                    break;
+                default:
+                    hipSpring = 800f; hipDamper = 80f; hipMaxForce = 1500f;
+                    kneeSpring = 600f; kneeDamper = 60f; kneeMaxForce = 1200f;
+                    break;
+            }
+
+            float mult = _mod.JointSpringMultiplier;
+            SetDriveArray(HipJoints, hipSpring * mult, hipDamper * mult, hipMaxForce * mult);
+            SetDriveArray(KneeJoints, kneeSpring * mult, kneeDamper * mult, kneeMaxForce * mult);
+        }
+
+        private void SetDriveArray(ConfigurableJoint[] joints, float spring, float damper, float maxForce)
+        {
+            if (joints == null) return;
+
+            for (int i = 0; i < joints.Length; i++)
+            {
+                var joint = joints[i];
+                if (joint == null) continue;
+
+                JointDrive drive = joint.slerpDrive;
+                drive.positionSpring = spring;
+                drive.positionDamper = damper;
+                drive.maximumForce = maxForce;
+                joint.slerpDrive = drive;
+                joint.rotationDriveMode = RotationDriveMode.Slerp;
+            }
+        }
+
+        private ConfigurableJoint[] GetJointsByName(PhysicsRig rig, params string[] nameContains)
+        {
+            var allJoints = rig.GetComponentsInChildren<ConfigurableJoint>();
+            var result = new List<ConfigurableJoint>();
+
+            foreach (var joint in allJoints)
+            {
+                string n = joint.gameObject.name.ToLower();
+                foreach (var match in nameContains)
+                {
+                    if (n.Contains(match))
+                    {
+                        result.Add(joint);
+                        break;
+                    }
+                }
+            }
+
+            return result.ToArray();
+        }
+    }
+}
+PayneLabLegPoses.cs
+code
+C#
+using UnityEngine;
+using Il2CppSLZ.Marrow;
+
+namespace PayneLab
+{
+    public class PayneLabLegPoses
+    {
+        private readonly PayneLabMod _mod;
+
+        public Quaternion LeftHipTarget = Quaternion.identity;
+        public Quaternion RightHipTarget = Quaternion.identity;
+        public Quaternion LeftKneeTarget = Quaternion.identity;
+        public Quaternion RightKneeTarget = Quaternion.identity;
+
+        public PayneLabLegPoses(PayneLabMod mod) { _mod = mod; }
+
+        public void OnStateChanged(StuntState from, StuntState to) { }
+
+        public void Tick()
+        {
+            if (_mod.ActiveInput == InputMode.FullRagdoll || _mod.ActiveInput == InputMode.FullIK) return;
+            if (_mod.CachedRig == null) return;
+
+            switch (_mod.CurrentState)
+            {
+                case StuntState.Standing:
+                    ComputeStandingPose();
+                    break;
+                case StuntState.KneeSlide:
+                    ComputeKneeSlidePose();
+                    break;
+                case StuntState.ButtSlide:
+                    ComputeButtSlidePose();
+                    break;
+                case StuntState.Cannonball:
+                    ComputeCannonballPose();
+                    break;
+                case StuntState.SideLying:
+                    ComputeSideLyingPose();
+                    break;
+                case StuntState.DiveProne:
+                    ComputeDivePronePose();
+                    break;
+                case StuntState.GroundRoll:
+                    ComputeGroundRollPose();
+                    break;
+                case StuntState.Aerial:
+                    ComputeAerialPose();
+                    break;
+                case StuntState.Kick:
+                    ComputeKickPose();
+                    break;
+            }
+
+            ApplyPoseToJoints();
+        }
+
+        private void ComputeStandingPose()
+        {
+            LeftHipTarget = Quaternion.Euler(-5f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(-5f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(5f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(5f, 0f, 0f);
+        }
+
+        private void ComputeKneeSlidePose()
+        {
+            float kneeClearance = _mod.ObstacleClearance != null ? _mod.ObstacleClearance.GetKneeClearance() : 0f;
+            LeftHipTarget = Quaternion.Euler(20f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(20f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(90f + kneeClearance, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(90f + kneeClearance, 0f, 0f);
+        }
+
+        private void ComputeButtSlidePose()
+        {
+            LeftHipTarget = Quaternion.Euler(-60f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(-60f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(25f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(25f, 0f, 0f);
+        }
+
+        private void ComputeCannonballPose()
+        {
+            LeftHipTarget = Quaternion.Euler(90f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(90f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(110f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(110f, 0f, 0f);
+        }
+
+        private void ComputeSideLyingPose()
+        {
+            float spineRoll = GetSpineRoll();
+
+            if (spineRoll > 0f)
+            {
+                RightHipTarget = Quaternion.Euler(-5f, 0f, 0f);
+                LeftHipTarget = Quaternion.Euler(45f, 0f, 0f);
+                RightKneeTarget = Quaternion.Euler(5f, 0f, 0f);
+                LeftKneeTarget = Quaternion.Euler(45f, 0f, 0f);
+            }
+            else
+            {
+                LeftHipTarget = Quaternion.Euler(-5f, 0f, 0f);
+                RightHipTarget = Quaternion.Euler(45f, 0f, 0f);
+                LeftKneeTarget = Quaternion.Euler(5f, 0f, 0f);
+                RightKneeTarget = Quaternion.Euler(45f, 0f, 0f);
+            }
+        }
+
+        private void ComputeDivePronePose()
+        {
+            LeftHipTarget = Quaternion.Euler(15f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(15f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(10f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(10f, 0f, 0f);
+        }
+
+        private void ComputeGroundRollPose()
+        {
+            LeftHipTarget = Quaternion.Euler(70f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(70f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(90f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(90f, 0f, 0f);
+        }
+
+        private void ComputeAerialPose()
+        {
+            LeftHipTarget = Quaternion.Euler(45f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(45f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(60f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(60f, 0f, 0f);
+        }
+
+        private void ComputeKickPose()
+        {
+            LeftHipTarget = Quaternion.Euler(-40f, 0f, 0f);
+            RightHipTarget = Quaternion.Euler(40f, 0f, 0f);
+            LeftKneeTarget = Quaternion.Euler(5f, 0f, 0f);
+            RightKneeTarget = Quaternion.Euler(60f, 0f, 0f);
+        }
+
+        private void ApplyPoseToJoints()
+        {
+            var hips = _mod.JointControl.HipJoints;
+            var knees = _mod.JointControl.KneeJoints;
+
+            if (hips != null)
+            {
+                for (int i = 0; i < hips.Length; i++)
+                {
+                    var joint = hips[i];
+                    if (joint == null) continue;
+                    bool isLeft = joint.gameObject.name.ToLower().Contains("left");
+                    joint.targetRotation = isLeft ? LeftHipTarget : RightHipTarget;
+                }
+            }
+
+            if (knees != null)
+            {
+                for (int i = 0; i < knees.Length; i++)
+                {
+                    var joint = knees[i];
+                    if (joint == null) continue;
+                    bool isLeft = joint.gameObject.name.ToLower().Contains("left");
+                    joint.targetRotation = isLeft ? LeftKneeTarget : RightKneeTarget;
+                }
+            }
+        }
+
+        private float GetSpineRoll()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 0f;
+            return Mathf.Asin(Mathf.Clamp(rb.transform.right.y, -1f, 1f)) * Mathf.Rad2Deg;
+        }
+    }
+}
+PayneLabStateMachine.cs
+code
+C#
+using BoneLib;
+using UnityEngine;
+using Il2CppSLZ.Marrow;
+
+namespace PayneLab
+{
+    public class PayneLabStateMachine
+    {
+        private readonly PayneLabMod _mod;
+
+        private float _actionLockTimer = 0f;
+        private bool _kickActive;
+        private float _kickTimer;
+        private const float KickDuration = 0.35f;
+
+        public PayneLabStateMachine(PayneLabMod mod) { _mod = mod; }
+
+        public void Tick()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            // Decrement action lock timer
+            if (_actionLockTimer > 0f)
+            {
+                _actionLockTimer -= Time.fixedDeltaTime;
+            }
+
+            // Mode switch
+            if (_mod.Input.WantModeSwitch)
+            {
+                CycleInputMode();
+            }
+
+            // Ragdoll toggle
+            if (_mod.Input.WantRagdollToggle)
+            {
+                ToggleRagdoll();
+                return;
+            }
+
+            // Kick action
+            if (_mod.Input.WantKick && _mod.CurrentState == StuntState.Standing)
+            {
+                ExecuteKick();
+                return;
+            }
+
+            // Dive action
+            if (_mod.Input.WantDive && _mod.CurrentState == StuntState.Standing)
+            {
+                ExecuteDive();
+                return;
+            }
+
+            // If mid-action, keep action state
+            if (_actionLockTimer > 0f || _kickActive) return;
+
+            if (_mod.ActiveInput == InputMode.FullRagdoll)
+            {
+                DetectAerialState();
+                return;
+            }
+
+            DetectGroundState();
+        }
+
+        private void DetectGroundState()
+        {
+            Vector3 velocity = GetVelocity();
+            float horizontalSpeed = new Vector2(velocity.x, velocity.z).magnitude;
+            float height = GetBodyHeight();
+            float torsoPitch = GetTorsoPitch();
+            bool isGrounded = IsGrounded();
+            float groundDist = GetGroundDistance();
+
+            // Airborne check
+            if (!isGrounded && groundDist > _mod.GroundRayDistance)
+            {
+                DetectAerialState();
+                return;
+            }
+
+            // Ground roll triggered
+            if (_mod.Input.WantGroundRoll)
+            {
+                _mod.SetState(StuntState.GroundRoll);
+                _actionLockTimer = 0.5f; // Hold ground roll for half a second minimum
+                return;
+            }
+
+            // Sliding states: low height + high speed
+            if (height < 0.9f && horizontalSpeed > _mod.KneeSlideSpeedThreshold && isGrounded)
+            {
+                if (torsoPitch < 0f)
+                {
+                    _mod.SetState(StuntState.KneeSlide);
+                }
+                else
+                {
+                    _mod.SetState(StuntState.ButtSlide);
+                }
+                _mod.ObstacleClearance.SetSlideFriction(_mod.SlideFriction);
+                return;
+            }
+
+            // Side-Lying
+            float spineRoll = GetSpineRoll();
+            if (Mathf.Abs(spineRoll) > 45f && height < 0.8f)
+            {
+                _mod.SetState(StuntState.SideLying);
+                return;
+            }
+
+            // Prone / Dive recovery on ground
+            if (height < 0.6f && torsoPitch < -20f)
+            {
+                _mod.SetState(StuntState.DiveProne);
+                return;
+            }
+
+            // Restore normal friction when entering standing
+            if (_mod.CurrentState == StuntState.KneeSlide || _mod.CurrentState == StuntState.ButtSlide)
+            {
+                _mod.ObstacleClearance.RestoreFriction();
+            }
+
+            _mod.SetState(StuntState.Standing);
+        }
+
+        private void DetectAerialState()
+        {
+            bool isGrounded = IsGrounded();
+            float groundDist = GetGroundDistance();
+
+            if (isGrounded && groundDist <= _mod.GroundRayDistance)
+            {
+                DetectGroundState();
+                return;
+            }
+
+            float spineUpDot = GetSpineUpDot();
+            if (spineUpDot < -0.1f)
+            {
+                _mod.SetState(StuntState.Cannonball);
+            }
+            else
+            {
+                _mod.SetState(StuntState.Aerial);
+            }
+        }
+
+        private void ToggleRagdoll()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            if (_mod.ActiveInput == InputMode.FullRagdoll)
+            {
+                SetRigKinematic(rig, true);
+                rig.TurnOnRig();
+                rig.UnRagdollRig();
+                rig.EnableBallLoco();
+                _mod.ActiveInput = InputMode.ProcLeg;
+                _mod.SetState(StuntState.Standing);
+                _mod.LoggerInstance.Msg("[PayneLab] Ragdoll OFF -> ProcLeg");
+            }
+            else
+            {
+                rig.PhysicalLegs();
+                rig.DisableBallLoco();
+                SetRigKinematic(rig, false);
+                rig.UnRagdollRig();
+                _mod.ActiveInput = InputMode.FullRagdoll;
+                _mod.LoggerInstance.Msg("[PayneLab] Full Ragdoll ON");
+            }
+        }
+
+        private void CycleInputMode()
+        {
+            switch (_mod.ActiveInput)
+            {
+                case InputMode.ProcLeg:
+                    _mod.ActiveInput = InputMode.FullIK;
+                    _mod.LoggerInstance.Msg("[PayneLab] Mode -> FullIK");
+                    break;
+                case InputMode.FullIK:
+                    _mod.ActiveInput = InputMode.FullRagdoll;
+                    _mod.LoggerInstance.Msg("[PayneLab] Mode -> FullRagdoll");
+                    break;
+                case InputMode.FullRagdoll:
+                    _mod.ActiveInput = InputMode.ProcLeg;
+                    _mod.LoggerInstance.Msg("[PayneLab] Mode -> ProcLeg");
+                    break;
+            }
+        }
+
+        private void ExecuteKick()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            rig.PhysicalLegs();
+            rig.DisableBallLoco();
+
+            _mod.SetState(StuntState.Kick);
+
+            Vector3 kickDir = GetFacingDirection();
+            Vector3 up = Vector3.up;
+
+            if (_mod.CachedFootRb != null)
+            {
+                _mod.CachedFootRb.AddForce(kickDir * 320f + up * 80f, ForceMode.Impulse);
+            }
+            if (_mod.CachedKneeRb != null)
+            {
+                _mod.CachedKneeRb.AddForce(kickDir * 200f + up * 40f, ForceMode.Impulse);
+            }
+            if (_mod.CachedPelvisRb != null)
+            {
+                _mod.CachedPelvisRb.AddForce(kickDir * 160f, ForceMode.Impulse);
+            }
+
+            _kickTimer = 0f;
+            _kickActive = true;
+            _actionLockTimer = KickDuration;
+            _mod.LoggerInstance.Msg("[PayneLab] Kick Executed");
+        }
+
+        public void TickKick()
+        {
+            if (!_kickActive) return;
+
+            _kickTimer += Time.fixedDeltaTime;
+            if (_kickTimer >= KickDuration)
+            {
+                EndKick();
+            }
+        }
+
+        private void EndKick()
+        {
+            _kickActive = false;
+            _kickTimer = 0f;
+
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            rig.TurnOnRig();
+            rig.UnRagdollRig();
+            rig.EnableBallLoco();
+            _mod.SetState(StuntState.Standing);
+        }
+
+        private void ExecuteDive()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            rig.PhysicalLegs();
+            rig.DisableBallLoco();
+
+            Vector3 diveDir = GetFacingDirection() + Vector3.up * 0.2f;
+            if (_mod.CachedPelvisRb != null)
+            {
+                _mod.CachedPelvisRb.AddForce(diveDir * (_mod.DiveImpulseForce * 100f), ForceMode.Impulse);
+            }
+
+            _mod.SetState(StuntState.DiveProne);
+            _actionLockTimer = 0.6f; // Hold dive state for 0.6s
+            _mod.LoggerInstance.Msg("[PayneLab] Dive Executed");
+        }
+
+        private bool IsGrounded()
+        {
+            return GetGroundDistance() <= _mod.GroundRayDistance;
+        }
+
+        private float GetGroundDistance()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null || rig.m_pelvis == null) return 999f;
+
+            if (Physics.Raycast(rig.m_pelvis.position, Vector3.down, out RaycastHit hit, 5f))
+                return hit.distance;
+            return 999f;
+        }
+
+        private float GetBodyHeight()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null || rig.m_pelvis == null) return 1.5f;
+            return rig.m_pelvis.position.y;
+        }
+
+        private Vector3 GetVelocity()
+        {
+            if (_mod.CachedPelvisRb == null) return Vector3.zero;
+            return _mod.CachedPelvisRb.velocity;
+        }
+
+        private float GetTorsoPitch()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 0f;
+            return Mathf.Asin(Mathf.Clamp(rb.transform.forward.y, -1f, 1f)) * Mathf.Rad2Deg;
+        }
+
+        private float GetSpineRoll()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 0f;
+            return Mathf.Asin(Mathf.Clamp(rb.transform.right.y, -1f, 1f)) * Mathf.Rad2Deg;
+        }
+
+        private float GetSpineUpDot()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 1f;
+            return Vector3.Dot(rb.transform.up, Vector3.up);
+        }
+
+        private Vector3 GetFacingDirection()
+        {
+            if (Player.RigManager == null || Player.RigManager.physicsRig == null)
+                return Vector3.forward;
+
+            Vector3 dir = Player.RigManager.physicsRig.m_head.transform.forward;
+            dir.y = 0f;
+            return dir.sqrMagnitude > 0.001f ? dir.normalized : Vector3.forward;
+        }
+
+        private void SetRigKinematic(PhysicsRig rig, bool kinematic)
+        {
+            var rbs = rig.GetComponentsInChildren<Rigidbody>();
+            foreach (var rb in rbs)
+                rb.isKinematic = kinematic;
+        }
+    }
+}
+PayneLab.cs (With Avatar Swap Invalidation Hook)
+code
+C#
+using MelonLoader;
+using BoneLib;
+using BoneLib.BoneMenu;
+using UnityEngine;
+using Il2CppSLZ.Marrow;
+
+[assembly: MelonInfo(typeof(PayneLab.PayneLabMod), "PayneLab", "0.1.0", "Dillo")]
+[assembly: MelonGame("Stress Level Zero", "BONELAB")]
+
+namespace PayneLab
+{
+    public class PayneLabMod : MelonMod
+    {
+        public static PayneLabMod Instance { get; private set; }
+
+        public bool ModEnabled = true;
+
+        public StuntState CurrentState = StuntState.Standing;
+        public InputMode ActiveInput = InputMode.ProcLeg;
+
+        // Tuning
+        public float StabilizerSpring = 800f;
+        public float StabilizerDamping = 80f;
+        public float StabilizerMaxTorque = 400f;
+        public float JointSpringMultiplier = 1.0f;
+        public float AerialFlipTorque = 12f;
+        public float GroundRollTorque = 8f;
+        public float DiveImpulseForce = 8f;
+        public float SlideFriction = 0.05f;
+        public float GroundRayDistance = 1.2f;
+        public float KneeSlideSpeedThreshold = 2.0f;
+        public float ButtSlidePitchThreshold = 30f;
+
+        // Modules
+        internal PayneLabInput Input;
+        internal PayneLabStateMachine StateMachine;
+        internal PayneLabLegPoses LegPoses;
+        internal PayneLabJointControl JointControl;
+        internal PayneLabStabilizer Stabilizer;
+        internal PayneLabObstacleClearance ObstacleClearance;
+
+        // Cached Rig Bodies
+        internal PhysicsRig CachedRig;
+        internal Rigidbody CachedPelvisRb;
+        internal Rigidbody CachedSpineRb;
+        internal Rigidbody CachedHeadRb;
+        internal Rigidbody CachedFootRb;
+        internal Rigidbody CachedKneeRb;
+
+        private Il2CppSLZ.VRMK.Avatar _lastAvatar;
+
+        public override void OnInitializeMelon()
+        {
+            Instance = this;
+
+            Input = new PayneLabInput(this);
+            StateMachine = new PayneLabStateMachine(this);
+            LegPoses = new PayneLabLegPoses(this);
+            JointControl = new PayneLabJointControl(this);
+            Stabilizer = new PayneLabStabilizer(this);
+            ObstacleClearance = new PayneLabObstacleClearance(this);
+
+            SetupBoneMenu();
+            LoggerInstance.Msg("[PayneLab] Loaded. Active ragdoll stunt system initialized.");
+        }
+
+        public override void OnUpdate()
+        {
+            if (!ModEnabled) return;
+            Input.Tick();
+        }
+
+        public override void OnFixedUpdate()
+        {
+            if (!ModEnabled) return;
+
+            CheckAvatarChanged();
+            TryCacheRig();
+
+            if (CachedRig == null) return;
+
+            StateMachine.Tick();
+            StateMachine.TickKick();
+            LegPoses.Tick();
+            JointControl.Tick();
+            Stabilizer.Tick();
+            ObstacleClearance.Tick();
+        }
+
+        private void CheckAvatarChanged()
+        {
+            if (Player.RigManager == null) return;
+            if (Player.RigManager.avatar != _lastAvatar)
+            {
+                _lastAvatar = Player.RigManager.avatar;
+                InvalidateCache();
+            }
+        }
+
+        internal void TryCacheRig()
+        {
+            if (CachedRig != null) return;
+            if (Player.PhysicsRig == null) return;
+
+            CachedRig = Player.PhysicsRig;
+            CachedPelvisRb = CachedRig.m_pelvis.GetComponent<Rigidbody>();
+            CachedHeadRb = CachedRig.m_head.GetComponent<Rigidbody>();
+            CachedFootRb = CachedRig._feetRb;
+            CachedKneeRb = CachedRig._kneeRb;
+
+            if (CachedPelvisRb != null)
+            {
+                var spineJoint = CachedPelvisRb.GetComponentInChildren<ConfigurableJoint>();
+                if (spineJoint != null && spineJoint.connectedBody != null)
+                    CachedSpineRb = spineJoint.connectedBody;
+            }
+
+            JointControl.CacheJointDrives();
+            LoggerInstance.Msg("[PayneLab] Physics rig & drives cached successfully.");
+        }
+
+        internal void InvalidateCache()
+        {
+            CachedRig = null;
+            CachedPelvisRb = null;
+            CachedSpineRb = null;
+            CachedHeadRb = null;
+            CachedFootRb = null;
+            CachedKneeRb = null;
+            JointControl.InvalidateCache();
+        }
+
+        public override void OnSceneWasLoaded(int buildIndex, string sceneName)
+        {
+            InvalidateCache();
+            CurrentState = StuntState.Standing;
+            ActiveInput = InputMode.ProcLeg;
+        }
+
+        public void SetState(StuntState newState)
+        {
+            if (newState == CurrentState) return;
+
+            var prev = CurrentState;
+            CurrentState = newState;
+
+            JointControl.OnStateChanged(prev, newState);
+            LegPoses.OnStateChanged(prev, newState);
+
+            LoggerInstance.Msg($"[PayneLab] State: {prev} -> {newState}");
+        }
+
+        private void SetupBoneMenu()
+        {
+            var page = Page.Root.CreatePage("PayneLab", Color.red);
+            page.CreateBool("Enabled", Color.white, true, v => ModEnabled = v);
+            page.CreateFloat("Stabilizer Spring", Color.yellow, StabilizerSpring, 50f, 0f, 3000f, v => StabilizerSpring = v);
+            page.CreateFloat("Stabilizer Damping", Color.yellow, StabilizerDamping, 5f, 0f, 500f, v => StabilizerDamping = v);
+            page.CreateFloat("Stabilizer Max Torque", Color.yellow, StabilizerMaxTorque, 25f, 0f, 2000f, v => StabilizerMaxTorque = v);
+            page.CreateFloat("Joint Spring Mult", Color.cyan, JointSpringMultiplier, 0.1f, 0.1f, 3f, v => JointSpringMultiplier = v);
+            page.CreateFloat("Aerial Flip Torque", Color.green, AerialFlipTorque, 1f, 1f, 30f, v => AerialFlipTorque = v);
+            page.CreateFloat("Ground Roll Torque", Color.green, GroundRollTorque, 1f, 1f, 20f, v => GroundRollTorque = v);
+            page.CreateFloat("Dive Impulse", Color.magenta, DiveImpulseForce, 1f, 1f, 20f, v => DiveImpulseForce = v);
+            page.CreateFloat("Slide Friction", Color.gray, SlideFriction, 0.01f, 0f, 1f, v => SlideFriction = v);
+        }
+    }
+}
+4. NEXT TESTING OBJECTIVES FOR YOUR AI AGENT
+Rebuild Assembly: Compile using dotnet build against #1_Bonelab_Melon_References.
+In-Game Physics Verification:
+Sprint and crouch: Verify knee/butt slide initiates with zero jitter.
+Run and click Right Stick: Verify smooth dive forward without immediate upright snapping.
+Aerial Right Stick input: Verify controlled front/back/side flips without endless angular acceleration.
+Avatar Switch Test: Switch from a heavy avatar (e.g. Strong/Heavy) to Fast/Light using the radial menu; confirm no NullReferenceException is thrown in MelonLoader console.
+
+|
+
+
+
+Predictable Recovery: A stunt only feels good if getting back on your feet feels seamless. The transition from a slide/dive back into standard standing locomotion has to feel snappy, not sticky.
+So when you click the right stick in (or whatever ragdoll button) to get back up after ragdolling, then you would see your player torso and legs actually try to mimic standing up, but only whne you manually un ragdoll, so it doesnt interfere with proning and laying
+the game should never steal agency from you by auto-standing your character
+oh btw we are ignoring animating the arms/hands because that is player controlled.
+but the hips pelvis and legs would be used for procedural IK to get player to stand upright when the player clicks the ragdoll button bind thing to unragdoll after they went limp maunally.
+
+
+|
+
+By making recovery 100% manual and intent-driven, you turn being on the ground into an intentional tactical posture instead of a temporary accident.
+How the "Procedural Lower-Body Get-Up" Works
+Since the player's arms and hands are 100% tracked in real-time by the VR controllers (so you can keep aiming, reloading, or two-handing a rifle), the entire get-up motion is handled strictly by the pelvis, hips, and knees.
+code
+Code
+[GROUNDED / PRONE / SLIDE FINISHED]
+              │
+              │  (Player clicks Recovery Button / Stick)
+              ▼
+   ┌────────────────────────────────────────┐
+   │ PHASE 1: Foot/Knee Plant (~0.15s)      │
+   │ - Tuck feet/knees under Pelvis Center  │
+   │ - Crank joint drive stiffness to High  │
+   │ - Create a firm physics base           │
+   └──────────────────┬─────────────────────┘
+                      │
+                      ▼
+   ┌────────────────────────────────────────┐
+   │ PHASE 2: Pelvic Thrust & Extension     │
+   │ - Apply upward impulse to Pelvis       │
+   │ - Extend Hip & Knee joints to upright  │
+   │ - Ramp Upright Stabilizer to 1.0       │
+   └──────────────────┬─────────────────────┘
+                      │
+                      ▼
+[STANDING / MARROW BALL-LOCO RE-ENGAGED]
+Step-by-Step Physics Breakdown
+1. Zero Agency Theft (Staying Down Indefinitely)
+When a slide finishes, when you land a dive, or when you toggle ragdoll, the state machine does not revert to Standing.
+You enter a stable ground state (DiveProne, SideLying, or SeatedFire).
+You can sit on the ground, aim 360° with your tracked hands, barrel-roll with the Left Stick, or crawl without the game ever forcing you upright.
+2. Phase 1: Underbody Pre-load (Tuck & Plant)
+When you press the recovery button:
+Hips flex forward and knees bend (~90°): This pulls the feet and shins directly beneath the pelvis center of mass so you aren't trying to stand up with your legs sprawled 5 feet behind you.
+Spring Stiffness Ramps High: The joint motors lock in so the legs form a rigid, solid platform against the floor.
+3. Phase 2: Upward Kinetic Boost & Hip Extension
+Pelvis Vertical Impulse: A physical upward force is applied to the pelvis rigidbody to overcome body weight and break ground friction.
+Joint Extension: As the pelvis lifts, hip and knee target rotations transition to standing (
+0
+∘
+0 
+∘
+ 
+).
+Stabilizer Ramp: The upright stabilizer spring ramps up smoothly to pull the spine vertical.
+Locomotion Reconnect: Once the pelvis reaches standing height (
+>
+1.2
+m
+>1.2m
+), Marrow's EnableBallLoco() and UnRagdollRig() cleanly take over smooth locomotion with zero pop or snapping.
+Code Implementation for Your AI Agent
+Here is the exact code logic to handle the Manual Get-Up Transition while keeping arm tracking untouched.
+1. Update to PayneLabStateMachine.cs
+(Replaces auto-stand logic with persistent ground states and a dedicated ExecuteGetUp() sequence)
+code
+C#
+using BoneLib;
+using UnityEngine;
+using Il2CppSLZ.Marrow;
+
+namespace PayneLab
+{
+    public class PayneLabStateMachine
+    {
+        private readonly PayneLabMod _mod;
+
+        private float _actionLockTimer = 0f;
+        private bool _isGettingUp = false;
+        private float _getUpTimer = 0f;
+        private const float GetUpPlantDuration = 0.15f;
+        private const float GetUpTotalDuration = 0.40f;
+
+        public PayneLabStateMachine(PayneLabMod mod) { _mod = mod; }
+
+        public void Tick()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            if (_actionLockTimer > 0f) _actionLockTimer -= Time.fixedDeltaTime;
+
+            // Handle Manual Get-Up Sequence
+            if (_isGettingUp)
+            {
+                TickGetUp();
+                return;
+            }
+
+            // Mode switch
+            if (_mod.Input.WantModeSwitch)
+            {
+                CycleInputMode();
+            }
+
+            // Explicit manual recovery / get-up button
+            if (_mod.Input.WantRagdollToggle)
+            {
+                if (IsGroundedState(_mod.CurrentState) || _mod.ActiveInput == InputMode.FullRagdoll)
+                {
+                    StartGetUpSequence();
+                    return;
+                }
+                else
+                {
+                    // If standing in mid-air, toggle limp
+                    ToggleFullRagdoll();
+                    return;
+                }
+            }
+
+            // Kick action (only from standing)
+            if (_mod.Input.WantKick && _mod.CurrentState == StuntState.Standing)
+            {
+                ExecuteKick();
+                return;
+            }
+
+            // Dive action (only from standing)
+            if (_mod.Input.WantDive && _mod.CurrentState == StuntState.Standing)
+            {
+                ExecuteDive();
+                return;
+            }
+
+            if (_actionLockTimer > 0f) return;
+
+            DetectMovementState();
+        }
+
+        private void DetectMovementState()
+        {
+            Vector3 velocity = GetVelocity();
+            float horizontalSpeed = new Vector2(velocity.x, velocity.z).magnitude;
+            float height = GetBodyHeight();
+            float torsoPitch = GetTorsoPitch();
+            bool isGrounded = IsGrounded();
+            float groundDist = GetGroundDistance();
+
+            // Air check
+            if (!isGrounded && groundDist > _mod.GroundRayDistance)
+            {
+                float spineUpDot = GetSpineUpDot();
+                _mod.SetState(spineUpDot < -0.1f ? StuntState.Cannonball : StuntState.Aerial);
+                return;
+            }
+
+            // Ground roll trigger
+            if (_mod.Input.WantGroundRoll && isGrounded)
+            {
+                _mod.SetState(StuntState.GroundRoll);
+                _actionLockTimer = 0.45f;
+                return;
+            }
+
+            // Active slide transitions (when moving fast and low)
+            if (height < 0.9f && horizontalSpeed > _mod.KneeSlideSpeedThreshold && isGrounded)
+            {
+                if (torsoPitch < 0f)
+                    _mod.SetState(StuntState.KneeSlide);
+                else
+                    _mod.SetState(StuntState.ButtSlide);
+
+                _mod.ObstacleClearance.SetSlideFriction(_mod.SlideFriction);
+                return;
+            }
+
+            // IMPORTANT: If we came to a stop while in a slide, prone, or lying state,
+            // DO NOT AUTO-STAND. Stay in the grounded state until player requests get-up!
+            if (IsGroundedState(_mod.CurrentState))
+            {
+                // Let the player settle into prone or side-lying naturally
+                float spineRoll = GetSpineRoll();
+                if (Mathf.Abs(spineRoll) > 45f)
+                    _mod.SetState(StuntState.SideLying);
+                else
+                    _mod.SetState(StuntState.DiveProne);
+
+                return;
+            }
+
+            // If we're already standing, stay standing
+            _mod.SetState(StuntState.Standing);
+        }
+
+        public void StartGetUpSequence()
+        {
+            _isGettingUp = true;
+            _getUpTimer = 0f;
+            _mod.SetState(StuntState.GetUp);
+            _mod.LoggerInstance.Msg("[PayneLab] Initiating procedural get-up...");
+        }
+
+        private void TickGetUp()
+        {
+            _getUpTimer += Time.fixedDeltaTime;
+
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            // Phase 1: Tuck legs under pelvis to create base
+            if (_getUpTimer < GetUpPlantDuration)
+            {
+                // LegPoses will drive hips/knees into plant posture
+            }
+            // Phase 2: Pelvic upward thrust & extension
+            else if (_getUpTimer < GetUpTotalDuration)
+            {
+                if (_mod.CachedPelvisRb != null)
+                {
+                    // Smooth vertical assist
+                    _mod.CachedPelvisRb.AddForce(Vector3.up * 180f, ForceMode.Acceleration);
+                }
+            }
+            // Complete: Reconnect Marrow Standing Locomotion
+            else
+            {
+                _isGettingUp = false;
+                _getUpTimer = 0f;
+
+                SetRigKinematic(rig, true);
+                rig.TurnOnRig();
+                rig.UnRagdollRig();
+                rig.EnableBallLoco();
+
+                _mod.ObstacleClearance.RestoreFriction();
+                _mod.ActiveInput = InputMode.ProcLeg;
+                _mod.SetState(StuntState.Standing);
+                _mod.LoggerInstance.Msg("[PayneLab] Recovered to Standing.");
+            }
+        }
+
+        private bool IsGroundedState(StuntState state)
+        {
+            return state == StuntState.KneeSlide ||
+                   state == StuntState.ButtSlide ||
+                   state == StuntState.DiveProne ||
+                   state == StuntState.SideLying ||
+                   state == StuntState.GroundRoll ||
+                   state == StuntState.GetUp;
+        }
+
+        private void ToggleFullRagdoll()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            rig.PhysicalLegs();
+            rig.DisableBallLoco();
+            SetRigKinematic(rig, false);
+            rig.UnRagdollRig();
+            _mod.ActiveInput = InputMode.FullRagdoll;
+            _mod.SetState(StuntState.DiveProne);
+            _mod.LoggerInstance.Msg("[PayneLab] Manually Went Limp");
+        }
+
+        private void CycleInputMode()
+        {
+            switch (_mod.ActiveInput)
+            {
+                case InputMode.ProcLeg:
+                    _mod.ActiveInput = InputMode.FullIK;
+                    break;
+                case InputMode.FullIK:
+                    _mod.ActiveInput = InputMode.FullRagdoll;
+                    break;
+                case InputMode.FullRagdoll:
+                    _mod.ActiveInput = InputMode.ProcLeg;
+                    break;
+            }
+            _mod.LoggerInstance.Msg($"[PayneLab] Input Mode: {_mod.ActiveInput}");
+        }
+
+        private void ExecuteKick()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            rig.PhysicalLegs();
+            rig.DisableBallLoco();
+            _mod.SetState(StuntState.Kick);
+
+            Vector3 kickDir = GetFacingDirection();
+            if (_mod.CachedFootRb != null) _mod.CachedFootRb.AddForce(kickDir * 320f + Vector3.up * 80f, ForceMode.Impulse);
+            if (_mod.CachedPelvisRb != null) _mod.CachedPelvisRb.AddForce(kickDir * 160f, ForceMode.Impulse);
+
+            _actionLockTimer = 0.35f;
+        }
+
+        private void ExecuteDive()
+        {
+            var rig = _mod.CachedRig;
+            if (rig == null) return;
+
+            rig.PhysicalLegs();
+            rig.DisableBallLoco();
+
+            Vector3 diveDir = GetFacingDirection() + Vector3.up * 0.2f;
+            if (_mod.CachedPelvisRb != null)
+                _mod.CachedPelvisRb.AddForce(diveDir * (_mod.DiveImpulseForce * 100f), ForceMode.Impulse);
+
+            _mod.SetState(StuntState.DiveProne);
+            _actionLockTimer = 0.6f;
+        }
+
+        // --- Physics queries ---
+        private bool IsGrounded() => GetGroundDistance() <= _mod.GroundRayDistance;
+
+        private float GetGroundDistance()
+        {
+            if (_mod.CachedRig == null || _mod.CachedRig.m_pelvis == null) return 999f;
+            if (Physics.Raycast(_mod.CachedRig.m_pelvis.position, Vector3.down, out RaycastHit hit, 5f))
+                return hit.distance;
+            return 999f;
+        }
+
+        private float GetBodyHeight() => _mod.CachedRig?.m_pelvis != null ? _mod.CachedRig.m_pelvis.position.y : 1.5f;
+
+        private Vector3 GetVelocity() => _mod.CachedPelvisRb != null ? _mod.CachedPelvisRb.velocity : Vector3.zero;
+
+        private float GetTorsoPitch()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 0f;
+            return Mathf.Asin(Mathf.Clamp(rb.transform.forward.y, -1f, 1f)) * Mathf.Rad2Deg;
+        }
+
+        private float GetSpineRoll()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 0f;
+            return Mathf.Asin(Mathf.Clamp(rb.transform.right.y, -1f, 1f)) * Mathf.Rad2Deg;
+        }
+
+        private float GetSpineUpDot()
+        {
+            var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+            if (rb == null) return 1f;
+            return Vector3.Dot(rb.transform.up, Vector3.up);
+        }
+
+        private Vector3 GetFacingDirection()
+        {
+            if (Player.RigManager == null || Player.RigManager.physicsRig == null) return Vector3.forward;
+            Vector3 dir = Player.RigManager.physicsRig.m_head.transform.forward;
+            dir.y = 0f;
+            return dir.sqrMagnitude > 0.001f ? dir.normalized : Vector3.forward;
+        }
+
+        private void SetRigKinematic(PhysicsRig rig, bool kinematic)
+        {
+            var rbs = rig.GetComponentsInChildren<Rigidbody>();
+            foreach (var rb in rbs) rb.isKinematic = kinematic;
+        }
+    }
+}
+2. Add GetUp Pose Calculation in PayneLabLegPoses.cs
+(Adds the two-phase tuck & push pose during recovery)
+code
+C#
+// Inside PayneLabLegPoses.cs Tick() switch statement:
+case StuntState.GetUp:
+    ComputeGetUpPose();
+    break;
+
+// Implementation:
+private void ComputeGetUpPose()
+{
+    // Hips flex forward, knees bend tight to pull feet under pelvis
+    LeftHipTarget = Quaternion.Euler(-45f, 0f, 0f);
+    RightHipTarget = Quaternion.Euler(-45f, 0f, 0f);
+    LeftKneeTarget = Quaternion.Euler(85f, 0f, 0f);
+    RightKneeTarget = Quaternion.Euler(85f, 0f, 0f);
+}
+3. Add StuntState.GetUp Enum to PayneLab.cs
+code
+C#
+public enum StuntState
+{
+    Standing,
+    KneeSlide,
+    ButtSlide,
+    Cannonball,
+    SideLying,
+    DiveProne,
+    GroundRoll,
+    Aerial,
+    Kick,
+    GetUp // <-- Add this state
+}
+The Result in Action
+You can dive over a counter, slide to a halt behind low cover, and stay flat on the floor aiming under the desk with your pistols.
+You can roll onto your back using the Left Stick, shoot straight up through a skylight, and stay there as long as you want.
+When you decide it's time to move, you click the stick: your legs automatically plant and thrust upward, your torso rights itself, and you're immediately back in full standing locomotion without any camera snapping or physical glitches.

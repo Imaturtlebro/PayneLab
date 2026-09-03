@@ -1,0 +1,10 @@
+{
+  "name": "PayneLab",
+  "version_number": "0.1.0",
+  "website_url": "",
+  "description": "Active ragdoll stunt movement system. Procedural IK legs, slides, rolls, dives, flips, and cannonball tucks. Max Payne meets Bonelab physics.",
+  "dependencies": [
+    "LavaGang-MelonLoader-0.6.1",
+    "gnonme-BoneLib-3.2.1"
+  ]
+}

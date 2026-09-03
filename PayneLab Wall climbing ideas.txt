@@ -1,0 +1,71 @@
+PayneLab Wall climbing ideas
+
+i noticed, grabbing ledges let players feet actually up against het wall
+but thats only if player faces wall directly and is actually holding onto the ledge,
+i was thinknig we can have it probably be able to like
+if you hold onto a ledge to your left or right, then your leg on that closest side to wall would have its foot try to plant against the wall?
+Model 11:20 PM
+ThinkingThoughts
+Expand to view model thoughts
+
+chevron_right
+That is a textbook parkour and rock-climbing technique called "Wall Smearing" (or Flagging)—and in VR, it looks and feels unbelievable.
+In real life, when you hang from a ledge sideways or hold on with one hand, you never let both legs dangle like wet noodles. You instinctively plant your inside foot against the wall to create friction, stop your body from swinging like a pendulum, and give yourself a platform to push off from.
+Here is why adding this to PayneLab is a massive upgrade for both visuals and combat:
+1. The "Uncharted / John Wick" Ledge Hang Shot
+Imagine this scenario in slow-mo:
+You run along a catwalk, dive off the edge, and catch a steel pipe with your left hand.
+In vanilla BONELAB, your lower body just swings around blindly.
+With PayneLab Wall-Planting: Your left hip rotates, your left knee flexes, and your boot firmly plants against the concrete wall, stabilizing your torso.
+With your body locked in place, you draw a pistol with your free right hand, lean out sideways, and pick off enemies below you while hanging one-handed.
+2. How the Procedural Pose Works (The "Flagging" Stance)
+Instead of symmetrical legs, the procedural IK treats each leg differently based on where the wall is relative to your hands:
+The Wall-Side Leg (The Anchor):
+Hips rotate outward toward the wall (
+25
+∘
+25 
+∘
+ 
+–
+30
+∘
+30 
+∘
+ 
+).
+Knee bends (
+60
+∘
+60 
+∘
+ 
+–
+75
+∘
+75 
+∘
+ 
+) to push the sole of the foot flat against the wall plane.
+Joint stiffness goes medium-high to act as a physical brace that resists body swing.
+The Air-Side Leg (The Counterweight):
+Hangs loose or flags slightly outward/backward with relaxed spring stiffness to balance your center of mass.
+3. Kinematic Benefits: Killing the "Pendulum Swing"
+One of the most annoying things about climbing or hanging in VR is that once your character starts swinging, it’s hard to stop.
+By having the inside foot push lightly against the wall normal (
+−
+n
+⃗
+wall
+− 
+n
+  
+wall
+​
+ 
+), it acts like a physical kickstand. It kills rotational wobble instantly, making hanging around corners or under windows feel grounded and steady.
+4. Ledge-Push & Corner Mantles
+It also sets up an offensive maneuver: The Ledge Kick-Off.
+While hanging and braced against the wall with your foot, tapping Jump (Right A) or pushing away from the wall can trigger an impulse from that planted foot, launching you laterally around the corner or vaulting you over the railing.
+The Verdict
+Looking down in VR while hanging from a pipe and actually seeing your character's boot pressed flat against the bricks—instead of dangling in empty space—is one of those micro-details that instantly separates a generic VR mod from a AAA-feeling movement system. It fits right into PayneLab's procedural leg pipeline.
