@@ -1,0 +1,2594 @@
+
+
+my PayneLab bonelab code mod
+
+
+
+
+its very broken rn, the legs are crazy and they cause issues, dive mode is broken, ragdoll mode is littl emore stable
+
+
+but overall, the legs cause issues rn
+
+
+im trying to make it better
+
+so you can have like omnidirectional diving/proning stuff with RS
+
+Next tme i reply, i will be sending ("PayneLabUtils.cs" "PayneLabInput.cs" "PayneLabContactProbe.cs" and "PayneLab.cs") because i can only send 5 files at a time in one message.
+
+|
+
+
+
+
+analyze the mod files i sent, and see abotu improving the jjanky bullshit with legs if you see anything about legs, if you dont see any useful changes/improvements to make, then just tell me so, and ill sen dhte other files so you can try to fix the legs next message.
+
+
+
+
+Yes — I definitely see useful leg-related changes to try from these five files. I would **not** say “nothing useful” here.
+
+The legs are being driven by several systems at once:
+
+- `PayneLabLegPoses` writing `ConfigurableJoint.targetRotation`
+- `PayneLabJointControl` changing joint springs/dampers/forces
+- `PayneLabObstacleClearance` injecting extra knee lift
+- `PayneLabStateMachine` switching states that instantly change pose/drive goals
+- `PayneLabStabilizer` adding body torque
+- possible friction material swaps on the leg/pelvis colliders
+
+When one of those is slightly wrong, the legs can look “crazy” because the joint drives amplify the error. Ragdoll being more stable makes sense: in ragdoll you drop to weak drives and mostly neutral targets, so the bad targeting/conversion has less authority.
+
+Below are the biggest suspects and the changes I would make first.
+
+---
+
+# 1. Biggest suspect: `ConfigurableJoint.targetRotation` conversion in `PayneLabLegPoses`
+
+This function is the most likely source of violent leg behavior:
+
+```csharp
+private Quaternion ComputeJointTargetRotation(ConfigurableJoint joint, Quaternion desiredPose)
+{
+    if (joint == null) return Quaternion.identity;
+
+    Quaternion inv = Quaternion.Inverse(desiredPose);
+
+    Vector3 right = joint.axis;
+    Vector3 forward = Vector3.Cross(joint.axis, joint.secondaryAxis);
+
+    if (forward.sqrMagnitude < 0.0001f)
+    {
+        return inv;
+    }
+
+    forward.Normalize();
+
+    Vector3 up = Vector3.Cross(forward, right).normalized;
+    Quaternion jointSpace = Quaternion.LookRotation(forward, up);
+
+    return Quaternion.Inverse(jointSpace) * inv * jointSpace;
+}
+```
+
+This is doing a nontrivial conversion from a simple “bend pose” into joint-axis space. If the avatar’s hip/knee joint axes are not exactly what this expects, the joint can receive a target that twists the leg instead of bending it cleanly. With high joint springs, that becomes explosive.
+
+## Why this matters
+
+Your pose targets are mostly simple X-axis bends:
+
+```csharp
+LeftKneeTarget = Quaternion.Euler(90f + kneeClearance, 0f, 0f);
+```
+
+But Unity/PhysX `ConfigurableJoint` orientation targets are very easy to get wrong, especially across different BONELAB avatars. If the mapping is off by one axis, the knee/hip can:
+
+- bend backward
+- twist sideways
+- jitter violently
+- fight the stabilizer
+- invert behavior depending on avatar
+- look fine on one rig and crazy on another
+
+## Quick diagnostic
+
+Temporarily disable the joint-space conversion and see if the legs calm down:
+
+```csharp
+private Quaternion ComputeJointTargetRotation(ConfigurableJoint joint, Quaternion desiredPose)
+{
+    if (joint == null) return Quaternion.identity;
+
+    // TEMP diagnostic: bypass complex joint-space conversion
+    return Quaternion.Inverse(desiredPose);
+}
+```
+
+Or try the opposite:
+
+```csharp
+return desiredPose;
+```
+
+If one of those immediately makes the legs less insane, then the current `jointSpace` conversion is the main problem.
+
+Long-term, I would move away from this generic conversion and instead store per-joint calibration:
+
+- initial local rotation
+- primary bend axis
+- sign for left/right
+- min/max angle clamp
+
+That will be much more stable than trying to infer everything from `joint.axis` and `joint.secondaryAxis` every frame.
+
+---
+
+# 2. Pose slew rate is too high
+
+This is also suspicious:
+
+```csharp
+private const float MaxPoseSlewRate = 420f; // degrees per second
+```
+
+420 degrees/sec is very fast for physics-driven ragdoll joints, especially knees.
+
+For example, standing knee target:
+
+```csharp
+LeftKneeTarget = Quaternion.Euler(5f, 0f, 0f);
+```
+
+Knee slide target:
+
+```csharp
+LeftKneeTarget = Quaternion.Euler(90f + kneeClearance, 0f, 0f);
+```
+
+That is an ~85 degree change. At 420 deg/sec, it can arrive in about 0.2 seconds. With strong knee springs, that can spike the solver.
+
+## Change
+
+Split hip/knee slew rates and lower them:
+
+```csharp
+private const float MaxHipSlewRate = 180f;
+private const float MaxKneeSlewRate = 140f;
+```
+
+Then:
+
+```csharp
+float hipStep = MaxHipSlewRate * Time.fixedDeltaTime;
+float kneeStep = MaxKneeSlewRate * Time.fixedDeltaTime;
+
+_curLeftHip = Quaternion.RotateTowards(_curLeftHip, LeftHipTarget, hipStep);
+_curRightHip = Quaternion.RotateTowards(_curRightHip, RightHipTarget, hipStep);
+_curLeftKnee = Quaternion.RotateTowards(_curLeftKnee, LeftKneeTarget, kneeStep);
+_curRightKnee = Quaternion.RotateTowards(_curRightKnee, RightKneeTarget, kneeStep);
+```
+
+This alone may reduce the “legs go crazy on state change” behavior.
+
+---
+
+# 3. `ObstacleClearance` is currently too aggressive and can leave stale knee lift
+
+This part is active during:
+
+```csharp
+StuntState.KneeSlide
+StuntState.ButtSlide
+StuntState.DiveProne
+```
+
+But the knee clearance value is only used in:
+
+```csharp
+ComputeKneeSlidePose()
+```
+
+And it can push the knee target up by 25 degrees:
+
+```csharp
+_kneeClearanceOffset = Mathf.Lerp(_kneeClearanceOffset, 25f, Time.deltaTime * 10f);
+```
+
+That is a lot.
+
+Also, if speed drops below 0.5, it returns early without decaying the offsets:
+
+```csharp
+if (speed < 0.5f) return;
+```
+
+So if you were sliding fast, detected an obstacle, then slowed down, the knee can remain lifted at a high angle for no reason.
+
+## Problems here
+
+- `25f` degrees is too much for a reactive knee lift.
+- It can false-positive on floor lips/ramps/collider seams.
+- It does not check hit normal.
+- It remains active during `DiveProne`, even though `DiveProne` does not use the value.
+- Slow slides keep stale clearance.
+- `GetFootClearance()` is not used by `PayneLabLegPoses`, so foot clearance is just accumulating for nothing.
+
+## Immediate safe change
+
+In `PayneLabLegPoses.ComputeKneeSlidePose`, temporarily disable clearance:
+
+```csharp
+private void ComputeKneeSlidePose()
+{
+    // TEMP: disable obstacle clearance until probe is retuned
+    float kneeClearance = 0f;
+
+    LeftHipTarget = Quaternion.Euler(20f, 0f, 0f);
+    RightHipTarget = Quaternion.Euler(20f, 0f, 0f);
+
+    LeftKneeTarget = Quaternion.Euler(90f + kneeClearance, 0f, 0f);
+    RightKneeTarget = Quaternion.Euler(90f + kneeClearance, 0f, 0f);
+}
+```
+
+If the legs get calmer during slides, obstacle clearance was contributing.
+
+## Better retuned version
+
+If you want to keep it later, make it much more conservative:
+
+```csharp
+public void Tick()
+{
+    // Only KneeSlide should currently affect knee pose
+    if (_mod.CurrentState != StuntState.KneeSlide)
+    {
+        _kneeClearanceOffset = Mathf.Lerp(_kneeClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        _footClearanceOffset = Mathf.Lerp(_footClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        return;
+    }
+
+    var rig = _mod.CachedRig;
+    if (rig == null) return;
+
+    Vector3 velocity = _mod.CachedPelvisRb != null ? _mod.CachedPelvisRb.velocity : Vector3.zero;
+    float speed = new Vector2(velocity.x, velocity.z).magnitude;
+
+    if (speed < 0.5f)
+    {
+        _kneeClearanceOffset = Mathf.Lerp(_kneeClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        _footClearanceOffset = Mathf.Lerp(_footClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        return;
+    }
+
+    Vector3 moveDir = new Vector3(velocity.x, 0f, velocity.z).normalized;
+
+    Vector3 kneePos = _mod.CachedKneeRb != null ? _mod.CachedKneeRb.position : Vector3.zero;
+    Vector3 footPos = _mod.CachedFootRb != null ? _mod.CachedFootRb.position : Vector3.zero;
+
+    float probeDist = 0.35f + speed * 0.08f;
+
+    // Knee probe
+    RaycastHit kneeHit;
+    bool kneeObstacle = false;
+
+    if (PayneLabUtils.RaycastNonSelf(_mod, kneePos, moveDir, out kneeHit, probeDist))
+    {
+        float obstacleHeight = kneeHit.point.y - kneePos.y;
+
+        // Ignore mostly-horizontal ground hits.
+        // Only treat fairly vertical/wall-like surfaces as obstacles.
+        if (obstacleHeight > 0.10f && Mathf.Abs(kneeHit.normal.y) < 0.45f)
+        {
+            kneeObstacle = true;
+        }
+    }
+
+    _kneeClearanceOffset = Mathf.Lerp(
+        _kneeClearanceOffset,
+        kneeObstacle ? 10f : 0f,
+        Time.fixedDeltaTime * (kneeObstacle ? 6f : 8f)
+    );
+
+    // Foot clearance is currently unused, so keep it zero for now.
+    _footClearanceOffset = Mathf.Lerp(_footClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+}
+```
+
+And clamp it in the pose:
+
+```csharp
+float kneeClearance = Mathf.Clamp(_mod.ObstacleClearance.GetKneeClearance(), 0f, 10f);
+```
+
+For now, though, I would disable it or set it to zero while stabilizing the legs.
+
+---
+
+# 4. Joint drive smoothing is not actually smoothing over time
+
+In `PayneLabJointControl`, you have this:
+
+```csharp
+public void OnStateChanged(StuntState from, StuntState to)
+{
+    if (!_drivesCached)
+        CacheJointDrives();
+
+    ApplyStateDriveParams(to);
+}
+```
+
+And inside `ApplyStateDriveParams` you do:
+
+```csharp
+float rate = Mathf.Clamp(Time.fixedDeltaTime * DriveSmoothingRate, 0f, 1f);
+
+_hipSpringNow = Mathf.Lerp(_hipSpringNow, hipSpring * mult, rate);
+_hipDamperNow = Mathf.Lerp(_hipDamperNow, hipDamper * mult, rate);
+...
+```
+
+But `ApplyStateDriveParams` is only called on state change, not every tick.
+
+That means the smoothing only takes one small step when the state changes, then stops. It does not continuously smooth toward the target values.
+
+So state switches still cause hard spring/damper jumps.
+
+## Fix
+
+Call `ApplyStateDriveParams(_mod.CurrentState)` every fixed update when not in full ragdoll/full IK.
+
+Example:
+
+```csharp
+public void Tick()
+{
+    if (_mod.ActiveInput == InputMode.FullRagdoll)
+    {
+        ApplyFullBodyLimp();
+        _limpApplied = true;
+        return;
+    }
+
+    if (_limpApplied)
+    {
+        RestoreFullBodyDrives();
+        _limpApplied = false;
+    }
+
+    // If FullIK means the game's IK should own the legs, do not fight it.
+    if (_mod.ActiveInput == InputMode.FullIK)
+        return;
+
+    // Continuously smooth drive parameters
+    ApplyStateDriveParams(_mod.CurrentState);
+
+    var rb = _mod.CachedPelvisRb;
+    if (rb == null) return;
+
+    bool isGrounded = _mod.StateMachine != null && _mod.StateMachine.IsGrounded();
+
+    if (!isGrounded &&
+        (_mod.CurrentState == StuntState.Aerial ||
+         _mod.CurrentState == StuntState.Cannonball ||
+         _mod.CurrentState == StuntState.DiveProne))
+    {
+        ApplyAerialTorque();
+    }
+
+    if (_mod.CurrentState == StuntState.GroundRoll ||
+        _mod.CurrentState == StuntState.KneeSlide ||
+        _mod.CurrentState == StuntState.ButtSlide ||
+        _mod.CurrentState == StuntState.SideLying ||
+        _mod.CurrentState == StuntState.DiveProne)
+    {
+        ApplyGroundRollTorque();
+    }
+}
+```
+
+This makes drive transitions much softer.
+
+---
+
+# 5. Right-stick yaw can make prone legs pump because of `GetProneTuckBlend`
+
+This is especially relevant if you want omnidirectional diving/prone with right stick.
+
+In `PayneLabLegPoses`:
+
+```csharp
+private float GetProneTuckBlend(float settleRate)
+{
+    ...
+    float yawRate = Mathf.Abs(angVel.y);
+    float target = Mathf.Clamp01((yawRate - 1.5f) / 3.0f);
+    ...
+}
+```
+
+The comment says:
+
+```csharp
+// Only actual rapid physical yawing tucks knees (Right Stick deflection is omitted
+// so aiming and turning will never cause the knees to pump like bicycle pedals).
+```
+
+But if right stick torque is used to rotate the body, then right stick deflection **does** create physical yaw angular velocity. So this still causes knee tuck.
+
+That means if you implement RS omnidirectional prone turning, the legs may pump because:
+
+1. RS creates yaw torque.
+2. Body angular velocity rises.
+3. `GetProneTuckBlend` sees yaw rate.
+4. Knees tuck.
+5. Yaw slows.
+6. Knees untuck.
+7. Repeat.
+
+That can look very janky.
+
+## Fix
+
+Disable prone tuck while right stick is active, or make it much harder to trigger.
+
+Example:
+
+```csharp
+private float GetProneTuckBlend(float settleRate)
+{
+    var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+    if (rb == null) return 0f;
+
+    // If the player is actively using right stick control, do not let the
+    // resulting angular velocity pump the knees.
+    if (_mod.Input != null && _mod.Input.RightStick.sqrMagnitude > 0.04f)
+    {
+        _proneTuckBlend = Mathf.MoveTowards(
+            _proneTuckBlend,
+            0f,
+            Time.fixedDeltaTime * settleRate
+        );
+
+        return _proneTuckBlend;
+    }
+
+    Vector3 angVel = rb.angularVelocity;
+    if (!PayneLabUtils.IsFinite(angVel)) angVel = Vector3.zero;
+
+    float yawRate = Mathf.Abs(angVel.y);
+
+    // Raise threshold significantly
+    float target = Mathf.Clamp01((yawRate - 3.0f) / 4.0f);
+
+    float blend = _proneTuckBlend;
+    float step = Time.fixedDeltaTime * settleRate;
+
+    if (target > blend)
+        _proneTuckBlend = Mathf.MoveTowards(blend, target, step * 1.5f);
+    else
+        _proneTuckBlend = Mathf.MoveTowards(blend, target, step);
+
+    return _proneTuckBlend;
+}
+```
+
+For stable prone aiming, I might disable prone tuck entirely at first:
+
+```csharp
+private float GetProneTuckBlend(float settleRate)
+{
+    return 0f;
+}
+```
+
+Then add it back later if you really want it.
+
+---
+
+# 6. Ground roll torque during prone states may be fighting the legs
+
+In `PayneLabJointControl.Tick`:
+
+```csharp
+if (_mod.CurrentState == StuntState.GroundRoll ||
+    _mod.CurrentState == StuntState.KneeSlide ||
+    _mod.CurrentState == StuntState.ButtSlide ||
+    _mod.CurrentState == StuntState.SideLying ||
+    _mod.CurrentState == StuntState.DiveProne)
+{
+    ApplyGroundRollTorque();
+}
+```
+
+`ApplyGroundRollTorque` uses left stick X:
+
+```csharp
+float desiredRollRate = Mathf.Abs(ls.x) > 0.15f ? (-ls.x * _mod.GroundRollTorque) : 0f;
+```
+
+If left stick is also used for movement, this can accidentally roll the body while prone/side-lying. The legs then try to hold a pose while the pelvis is being torqued sideways. That can create leg freakouts.
+
+For stabilizing the legs, I would temporarily remove `DiveProne` and maybe `SideLying` from this list:
+
+```csharp
+if (_mod.CurrentState == StuntState.GroundRoll ||
+    _mod.CurrentState == StuntState.KneeSlide ||
+    _mod.CurrentState == StuntState.ButtSlide)
+{
+    ApplyGroundRollTorque();
+}
+```
+
+If you want omnidirectional RS prone control later, I would make that a separate orientation controller, not left-stick roll torque.
+
+---
+
+# 7. Aerial torque also brakes hard when right stick is released
+
+This code:
+
+```csharp
+Vector3 desiredLocalAngVel = new Vector3(
+    rs.y * _mod.AerialFlipTorque,
+    0f,
+    -rs.x * _mod.AerialFlipTorque
+);
+
+Vector3 currentLocalAngVel = rb.transform.InverseTransformDirection(rb.angularVelocity);
+Vector3 error = desiredLocalAngVel - currentLocalAngVel;
+Vector3 localTorque = Vector3.ClampMagnitude(error * AerialTorqueGain, MaxAerialAngularAccel);
+```
+
+When right stick is zero, desired angular velocity becomes zero. That means this becomes a strong angular brake.
+
+That can be useful, but it can also snap the body and make the legs react violently.
+
+Also:
+
+```csharp
+private const float MaxAerialAngularAccel = 300f;
+```
+
+That is quite high.
+
+## Suggested change
+
+Reduce the max accel and make stick-released damping softer.
+
+For example:
+
+```csharp
+private const float AerialTorqueGain = 6f;
+private const float MaxAerialAngularAccel = 120f;
+```
+
+And optionally only apply strong torque when the stick is actually deflected:
+
+```csharp
+private void ApplyAerialTorque()
+{
+    var rb = _mod.CachedPelvisRb;
+    if (rb == null) return;
+
+    if (!PayneLabUtils.IsFinite(rb.position) ||
+        !PayneLabUtils.IsFinite(rb.velocity) ||
+        !PayneLabUtils.IsFinite(rb.angularVelocity))
+        return;
+
+    Vector2 rs = _mod.Input.RightStick;
+
+    Vector3 currentLocalAngVel = rb.transform.InverseTransformDirection(rb.angularVelocity);
+
+    if (rs.sqrMagnitude < 0.02f)
+    {
+        // Gentle damping only when stick is released
+        Vector3 dampingTorque = -currentLocalAngVel * 2f;
+        dampingTorque = Vector3.ClampMagnitude(dampingTorque, 40f);
+
+        if (dampingTorque.sqrMagnitude > 0.01f)
+            rb.AddRelativeTorque(dampingTorque, ForceMode.Acceleration);
+
+        return;
+    }
+
+    Vector3 desiredLocalAngVel = new Vector3(
+        rs.y * _mod.AerialFlipTorque,
+        0f,
+        -rs.x * _mod.AerialFlipTorque
+    );
+
+    Vector3 error = desiredLocalAngVel - currentLocalAngVel;
+    Vector3 localTorque = Vector3.ClampMagnitude(error * AerialTorqueGain, MaxAerialAngularAccel);
+
+    if (localTorque.sqrMagnitude > 0.01f)
+    {
+        rb.AddRelativeTorque(localTorque, ForceMode.Acceleration);
+    }
+}
+```
+
+This will feel less violent.
+
+---
+
+# 8. Left/right leg assignment is fragile
+
+`PayneLabLegPoses` uses this:
+
+```csharp
+private bool IsLeftJoint(ConfigurableJoint joint, int index)
+{
+    string n = joint.gameObject.name.ToLower();
+
+    if (n.Contains("left") || n.Contains("lf")) return true;
+    if (n.Contains("right") || n.Contains("rt")) return false;
+
+    if (n.EndsWith("l")) return true;
+    if (n.EndsWith("r")) return false;
+
+    return index == 0;
+}
+```
+
+That is dangerous for arbitrary avatars.
+
+If the left/right guess is wrong, asymmetric poses like wall-run, kick, or future directional dive poses can drive the wrong leg.
+
+## Better approach
+
+Since `PayneLabJointControl` already knows the explicit rig bones:
+
+```csharp
+rig.m_hipLf
+rig.m_hipRt
+rig.m_kneeLf
+rig.m_kneeRt
+```
+
+store those directly.
+
+Example:
+
+```csharp
+internal ConfigurableJoint HipLeft;
+internal ConfigurableJoint HipRight;
+internal ConfigurableJoint KneeLeft;
+internal ConfigurableJoint KneeRight;
+```
+
+During cache:
+
+```csharp
+HipLeft = GetJointOrNull(rig.m_hipLf);
+HipRight = GetJointOrNull(rig.m_hipRt);
+KneeLeft = GetJointOrNull(rig.m_kneeLf);
+KneeRight = GetJointOrNull(rig.m_kneeRt);
+```
+
+Then in `PayneLabLegPoses.ApplyPoseToJoints`, prefer direct assignment:
+
+```csharp
+if (_mod.JointControl.HipLeft != null)
+    _mod.JointControl.HipLeft.targetRotation = ComputeJointTargetRotation(...);
+
+if (_mod.JointControl.HipRight != null)
+    _mod.JointControl.HipRight.targetRotation = ComputeJointTargetRotation(...);
+```
+
+Only fall back to name/array searching if the explicit bones are missing.
+
+This will make left/right behavior much more reliable.
+
+---
+
+# 9. Full ragdoll limp should probably disable rotation targets more explicitly
+
+In `ApplyFullBodyLimp` you set:
+
+```csharp
+drive.positionSpring = 40f;
+drive.positionDamper = 15f;
+drive.maximumForce = 250f;
+joint.slerpDrive = drive;
+```
+
+But you do not explicitly set:
+
+```csharp
+joint.rotationDriveMode = RotationDriveMode.Slerp;
+```
+
+If some joints are not using slerp drive, your limp values may not apply as expected.
+
+Also, `PayneLabLegPoses` still applies identity targets in full ragdoll:
+
+```csharp
+if (_mod.ActiveInput == InputMode.FullRagdoll)
+{
+    LeftHipTarget = Quaternion.identity;
+    RightHipTarget = Quaternion.identity;
+    LeftKneeTarget = Quaternion.identity;
+    RightKneeTarget = Quaternion.identity;
+
+    _curLeftHip = Quaternion.identity;
+    _curRightHip = Quaternion.identity;
+    _curLeftKnee = Quaternion.identity;
+    _curRightKnee = Quaternion.identity;
+
+    ApplyPoseToJoints();
+    return;
+}
+```
+
+That may be okay, but if the target conversion is wrong, even identity targets can be interpreted weirdly.
+
+For maximum ragdoll stability, I would make full ragdoll either:
+
+### Option A: No rotation drive at all
+
+```csharp
+drive.positionSpring = 0f;
+drive.positionDamper = 0f;
+drive.maximumForce = 0f;
+joint.slerpDrive = drive;
+joint.rotationDriveMode = RotationDriveMode.Slerp;
+```
+
+Or very weak:
+
+```csharp
+drive.positionSpring = 10f;
+drive.positionDamper = 5f;
+drive.maximumForce = 30f;
+```
+
+### Option B: Keep weak drive but do not write targetRotation in LegPoses
+
+If you want completely passive ragdoll, `LegPoses` should maybe not call `ApplyPoseToJoints()` during `FullRagdoll` at all.
+
+Since you said ragdoll is more stable, I would lean toward making full ragdoll as passive as possible.
+
+---
+
+# 10. Friction material replacement may be making legs slippery
+
+In `PayneLabObstacleClearance`:
+
+```csharp
+private static PhysicMaterial _slideMaterial;
+private static PhysicMaterial _defaultMaterial;
+```
+
+And:
+
+```csharp
+private static PhysicMaterial GetDefaultMaterial()
+{
+    if (_defaultMaterial == null)
+    {
+        _defaultMaterial = new PhysicMaterial("PayneLab_Default");
+        _defaultMaterial.hideFlags = HideFlags.HideAndDontSave;
+    }
+
+    return _defaultMaterial;
+}
+```
+
+This creates a new material but does not explicitly set friction values.
+
+Depending on Unity’s default `PhysicMaterial` constructor values, this may not match the original collider friction. If it ends up low/slippery, then after wall-running or sliding, the knee/foot/pelvis colliders may remain on a material that behaves differently from the avatar’s original materials.
+
+That can cause feet/knees to slide weirdly and make the legs look unstable.
+
+## Better approach
+
+Store the original collider materials before changing them, then restore those exact materials.
+
+Conceptually:
+
+```csharp
+private readonly Dictionary<Collider, PhysicMaterial> _originalMaterials = new();
+
+private void SetColliderMaterial(Rigidbody rb, PhysicMaterial material, bool rememberOriginal)
+{
+    if (rb == null || material == null) return;
+
+    try
+    {
+        var collider = rb.GetComponent<Collider>();
+        if (collider == null) return;
+
+        if (rememberOriginal && !_originalMaterials.ContainsKey(collider))
+        {
+            _originalMaterials[collider] = collider.material;
+        }
+
+        collider.material = material;
+    }
+    catch (System.Exception)
+    {
+    }
+}
+```
+
+Then restore:
+
+```csharp
+private void RestoreColliderOriginal(Rigidbody rb)
+{
+    if (rb == null) return;
+
+    try
+    {
+        var collider = rb.GetComponent<Collider>();
+        if (collider == null) return;
+
+        if (_originalMaterials.TryGetValue(collider, out PhysicMaterial original))
+        {
+            collider.material = original;
+            _originalMaterials.Remove(collider);
+        }
+    }
+    catch (System.Exception)
+    {
+    }
+}
+```
+
+At minimum, if you keep the shared default material, explicitly set friction:
+
+```csharp
+_defaultMaterial.staticFriction = 0.6f;
+_defaultMaterial.dynamicFriction = 0.6f;
+```
+
+But storing originals is much safer.
+
+---
+
+# 11. Drive values are pretty hot for unstable legs
+
+These values are not insane by themselves, but if the target rotation is wrong, they will make the problem much worse.
+
+Current standing:
+
+```csharp
+hipSpring = 600f; hipDamper = 80f; hipMaxForce = 1400f;
+kneeSpring = 400f; kneeDamper = 60f; kneeMaxForce = 1100f;
+```
+
+Knee slide:
+
+```csharp
+hipSpring = 400f; hipDamper = 80f; hipMaxForce = 800f;
+kneeSpring = 700f; kneeDamper = 100f; kneeMaxForce = 1400f;
+```
+
+Kick:
+
+```csharp
+hipSpring = 900f; hipDamper = 80f; hipMaxForce = 1800f;
+kneeSpring = 750f; kneeDamper = 70f; kneeMaxForce = 1500f;
+```
+
+If the legs are currently unstable, I would temporarily reduce them by ~30–50%.
+
+Example safer starting values:
+
+```csharp
+case StuntState.Standing:
+    hipSpring = 420f; hipDamper = 65f; hipMaxForce = 900f;
+    kneeSpring = 300f; kneeDamper = 50f; kneeMaxForce = 700f;
+    break;
+
+case StuntState.KneeSlide:
+    hipSpring = 300f; hipDamper = 60f; hipMaxForce = 600f;
+    kneeSpring = 450f; kneeDamper = 80f; kneeMaxForce = 900f;
+    break;
+
+case StuntState.ButtSlide:
+    hipSpring = 260f; hipDamper = 50f; hipMaxForce = 520f;
+    kneeSpring = 220f; kneeDamper = 40f; kneeMaxForce = 450f;
+    break;
+
+case StuntState.DiveProne:
+    hipSpring = 220f; hipDamper = 40f; hipMaxForce = 450f;
+    kneeSpring = 160f; kneeDamper = 30f; kneeMaxForce = 350f;
+    break;
+
+case StuntState.SideLying:
+    hipSpring = 240f; hipDamper = 42f; hipMaxForce = 500f;
+    kneeSpring = 180f; kneeDamper = 34f; kneeMaxForce = 400f;
+    break;
+```
+
+Then raise them back up only after the legs stop exploding.
+
+---
+
+# 12. Dive-specific issues I can already see
+
+You mentioned dive mode is broken. From these files, a few things stand out.
+
+## DiveProne is treated as a grounded state
+
+```csharp
+public bool IsGroundedState(StuntState state)
+{
+    return state == StuntState.KneeSlide ||
+           state == StuntState.ButtSlide ||
+           state == StuntState.DiveProne ||
+           state == StuntState.SideLying ||
+           state == StuntState.GroundRoll ||
+           state == StuntState.GetUp;
+}
+```
+
+That may be intentional for get-up logic, but it also affects state detection.
+
+In `DetectMovementState`:
+
+```csharp
+if (!isGrounded && _airborneFrames >= AirborneConfirmFrames && !IsGroundedState(_mod.CurrentState))
+{
+    ...
+}
+```
+
+Because `DiveProne` is a grounded state, the mod will not automatically switch out of `DiveProne` into `Aerial` while airborne.
+
+That might be good for a directional dive, but it can also mean the body stays in a grounded-style pose while airborne. If `IsGrounded()` then flickers because of contact probes or vertical velocity, the legs can get confused.
+
+I would separate these concepts:
+
+```csharp
+IsDownedState()
+IsGroundContactState()
+IsAerialControlState()
+```
+
+`DiveProne` may be a downed state, but not necessarily a ground-contact state.
+
+## Dive impulse may be too large or too abrupt
+
+```csharp
+Vector3 diveImpulse =
+    (horizontalDir * 1.0f + Vector3.up * 0.20f).normalized *
+    (_mod.DiveImpulseForce * 25f) * m;
+```
+
+Without knowing `DiveImpulseForce`, this could be very strong. If the impulse launches the pelvis but the legs are trying to hold a pose, the joints can spazz.
+
+I would clamp the resulting pelvis speed after dive.
+
+Example:
+
+```csharp
+float maxDiveSpeed = 6f;
+
+Vector3 currentVel = rb.velocity;
+float currentSpeed = currentVel.magnitude;
+
+if (currentSpeed > maxDiveSpeed)
+{
+    rb.velocity = currentVel.normalized * maxDiveSpeed;
+}
+```
+
+Or apply dive as a velocity change rather than impulse, with clamping.
+
+## DiveProne + ground roll torque + prone tuck is a bad combo
+
+Right now dive prone can receive:
+
+- aerial torque when airborne
+- ground roll torque when grounded
+- prone tuck from yaw angular velocity
+- stabilizer roll damping when slow
+- pose target changes from `liesOnBack`
+
+That is too many systems touching the same body at once.
+
+For fixing the legs, I would simplify dive prone:
+
+- no ground roll torque
+- no prone tuck
+- very soft leg drives
+- weak or zero upright stabilizer
+- RS controls body orientation only, not legs
+
+---
+
+# 13. `ResetPoseTargets` can cause a hard snap
+
+This:
+
+```csharp
+public void ResetPoseTargets()
+{
+    _poseInitialized = false;
+
+    _curLeftHip = Quaternion.identity;
+    _curRightHip = Quaternion.identity;
+    _curLeftKnee = Quaternion.identity;
+    _curRightKnee = Quaternion.identity;
+}
+```
+
+Then next tick:
+
+```csharp
+if (!_poseInitialized)
+{
+    _curLeftHip = LeftHipTarget;
+    _curRightHip = RightHipTarget;
+    _curLeftKnee = LeftKneeTarget;
+    _curRightKnee = RightKneeTarget;
+
+    _poseInitialized = true;
+}
+```
+
+That bypasses slew entirely.
+
+If `ResetPoseTargets()` gets called during gameplay, for example after cache invalidation or avatar swap, the legs can snap to the new target instantly.
+
+A safer version would initialize current values from the actual joint state, or at least from the current pose targets, not identity.
+
+Simple safer version:
+
+```csharp
+public void ResetPoseTargets()
+{
+    _poseInitialized = false;
+
+    // Do not hard-zero current values.
+    // Let the next tick snap to the current computed targets instead.
+}
+```
+
+But even better: when initializing, capture the current joint local rotations and convert them back into approximate current targets. That is more complex, but it prevents pops.
+
+---
+
+# 14. Missing finite guards in pose application
+
+You guard a lot of physics values elsewhere, but `ApplyPoseToJoints` does not check whether the quaternions are finite.
+
+Add something like:
+
+```csharp
+private static bool IsValidQuaternion(Quaternion q)
+{
+    return float.IsFinite(q.x) &&
+           float.IsFinite(q.y) &&
+           float.IsFinite(q.z) &&
+           float.IsFinite(q.w);
+}
+```
+
+Then before applying:
+
+```csharp
+if (!IsValidQuaternion(_curLeftHip)) _curLeftHip = Quaternion.identity;
+if (!IsValidQuaternion(_curRightHip)) _curRightHip = Quaternion.identity;
+if (!IsValidQuaternion(_curLeftKnee)) _curLeftKnee = Quaternion.identity;
+if (!IsValidQuaternion(_curRightKnee)) _curRightKnee = Quaternion.identity;
+```
+
+And before using targets:
+
+```csharp
+if (!IsValidQuaternion(LeftHipTarget)) LeftHipTarget = Quaternion.identity;
+if (!IsValidQuaternion(RightHipTarget)) RightHipTarget = Quaternion.identity;
+if (!IsValidQuaternion(LeftKneeTarget)) LeftKneeTarget = Quaternion.identity;
+if (!IsValidQuaternion(RightKneeTarget)) RightKneeTarget = Quaternion.identity;
+```
+
+This will not fix the root cause, but it prevents one NaN from permanently poisoning the legs.
+
+---
+
+# 15. Stabilizer slow aim damping could also contribute slightly
+
+This is not the main suspect, but it is worth noting:
+
+```csharp
+private void ApplySlowAimRollDamping()
+{
+    ...
+    Vector3 rollAxis = spine.transform.forward;
+    Vector3 angVel = spine.angularVelocity;
+
+    float spin = Vector3.Dot(angVel, rollAxis);
+
+    if (Mathf.Abs(spin) < 0.01f) return;
+
+    spine.AddTorque(-rollAxis * (spin * AimRollDamping), ForceMode.Acceleration);
+}
+```
+
+`AimRollDamping = 40f` is fairly strong if the body is already unstable.
+
+Also, it does not guard `angVel` for NaNs.
+
+Add:
+
+```csharp
+if (!PayneLabUtils.IsFinite(angVel)) return;
+```
+
+And for testing, reduce:
+
+```csharp
+private const float AimRollDamping = 12f;
+```
+
+If prone legs calm down, this was contributing.
+
+---
+
+# 16. What I would change first, in priority order
+
+If I were trying to get the legs under control quickly, I would do these in this order:
+
+## Priority 1: Disable obstacle clearance influence
+
+In `PayneLabLegPoses.ComputeKneeSlidePose`:
+
+```csharp
+float kneeClearance = 0f;
+```
+
+## Priority 2: Lower pose slew rate
+
+Use:
+
+```csharp
+private const float MaxHipSlewRate = 180f;
+private const float MaxKneeSlewRate = 140f;
+```
+
+## Priority 3: Make joint drive smoothing continuous
+
+Call:
+
+```csharp
+ApplyStateDriveParams(_mod.CurrentState);
+```
+
+every tick in `PayneLabJointControl.Tick()` when not in ragdoll/full IK.
+
+## Priority 4: Disable prone tuck while right stick is active
+
+Or disable `GetProneTuckBlend` completely for now.
+
+## Priority 5: Remove ground roll torque from `DiveProne`
+
+At least temporarily.
+
+## Priority 6: Reduce joint springs by ~30–50%
+
+Especially knee slide, standing, and kick.
+
+## Priority 7: Test bypassing `ComputeJointTargetRotation`
+
+This is the most likely deep cause, but also the hardest to safely rebuild.
+
+---
+
+# 17. A good “safe legs” test configuration
+
+For your next test build, I would try this configuration:
+
+```csharp
+MaxHipSlewRate = 180f;
+MaxKneeSlewRate = 140f;
+
+kneeClearance = 0f;
+_proneTuckBlend = forced 0f;
+
+GroundRollTorque disabled in DiveProne and SideLying
+AerialTorqueGain reduced
+MaxAerialAngularAccel reduced
+
+Joint springs reduced ~40%
+```
+
+If that makes the legs much calmer, then we know the issue is mostly targeting/aggression, not core state logic.
+
+If the legs are still crazy even with low springs and no obstacle clearance, then the main culprit is almost certainly the `ConfigurableJoint.targetRotation` coordinate conversion.
+
+---
+
+# 18. What I need from the next files
+
+When you send:
+
+- `PayneLabUtils.cs`
+- `PayneLabInput.cs`
+- `PayneLabContactProbe.cs`
+- `PayneLab.cs`
+
+these will answer several remaining questions:
+
+## `PayneLab.cs`
+
+Most important. I need to see:
+
+- tick order
+- whether `LegPoses.Tick()` runs before or after `JointControl.Tick()`
+- when `SetState()` happens
+- how `CachedKneeRb` and `CachedFootRb` are chosen
+- whether cached knee/foot is left or right
+- how often joints are invalidated/rebuilt
+- whether `LegBendInvert` is per-avatar or global
+
+Tick order matters a lot. For example, `ObstacleClearance` should run before `LegPoses` if `LegPoses` reads clearance. State changes should happen before joint drives/pose targets are updated.
+
+## `PayneLabInput.cs`
+
+Needed for:
+
+- right stick mapping
+- dive input
+- kick input
+- ragdoll toggle
+- whether RS is already being used for aerial orientation
+- deadzones
+- input mode switching
+
+This matters because RS-based omnidirectional dive/prone will need clean separation between:
+
+- movement intent
+- orientation intent
+- action inputs
+- ragdoll toggle
+
+## `PayneLabContactProbe.cs`
+
+Needed for:
+
+- how `_contactGrounded` is computed
+- how `_contactWall` is computed
+- whether ground contact flickers
+- whether wall contact flickers
+- whether contacts include the avatar’s own colliders
+- whether contact points are stable enough for state transitions
+
+Noisy contact probes can cause state flicker, and state flicker causes leg target/drive flicker.
+
+## `PayneLabUtils.cs`
+
+Needed for:
+
+- raycast/overlap filtering
+- whether `RaycastNonSelf` actually excludes all avatar colliders
+- finite checks
+- capsule cast behavior
+- layer masks
+
+If `RaycastNonSelf` accidentally hits the avatar’s own leg colliders, obstacle clearance could go insane.
+
+---
+
+# Bottom line
+
+Yes, there are definitely useful improvements visible from these files.
+
+The biggest leg-related red flags are:
+
+1. **The joint target rotation conversion may be wrong or avatar-dependent.**
+2. **Pose slew is too fast.**
+3. **Obstacle clearance is too aggressive and can leave stale knee lift.**
+4. **Joint drive smoothing is not continuously applied.**
+5. **Right-stick yaw can cause prone knee pumping through `GetProneTuckBlend`.**
+6. **Ground roll torque during prone states may be fighting the leg pose.**
+7. **Left/right joint assignment is fragile.**
+8. **Friction material replacement may be altering collider behavior.**
+9. **Full ragdoll mode may still be partially fighting target rotations.**
+10. **Dive has too many systems interacting at once.**
+
+If you want the fastest immediate test, do this:
+
+- disable knee clearance
+- disable prone tuck
+- lower pose slew rate
+- reduce joint springs
+- make drive smoothing continuous
+- remove ground roll torque from `DiveProne`
+
+Then send the remaining files, and we can attack the actual `ConfigurableJoint` target rotation mapping and the RS omnidirectional dive/prone controller properly.
+
+|
+
+Yes — with the remaining files, the picture is complete enough to proceed.
+
+The legs are not broken by one single bug. There are several systems interacting badly:
+
+1. **Slide friction is being swapped to a material that is not properly restored.**  
+   This is a major suspect for slippery/unstable legs after dives/slides.
+
+2. **Only one cached knee/foot rigidbody is used for probes/friction/kick forces.**  
+   That can create asymmetric leg behavior.
+
+3. **`IsGrounded()` trusts any contact too aggressively.**  
+   Any small foot/knee contact can make dive/prone consider the avatar grounded, which kills aerial dive control and can cause state flicker.
+
+4. **Joint drive smoothing is not actually continuous.**  
+   Drive parameters mostly snap on state change.
+
+5. **Obstacle clearance runs too late, is too aggressive, and can leave stale knee lift.**
+
+6. **The leg pose target conversion into `ConfigurableJoint.targetRotation` is still the deepest suspect.**  
+   If that conversion is wrong for an avatar, high joint drives amplify it into “crazy legs”.
+
+7. **Full IK still receives stabilizer/torque/drive interference unless explicitly blocked.**
+
+Below is the patch set I would apply first.
+
+---
+
+# 1. PayneLab.cs changes
+
+## A. Add debug toggle for joint target mapping
+
+Inside `PayneLabMod`, near your other tuning fields, add:
+
+```csharp
+public bool DebugSimpleJointTargets = false;
+```
+
+Then in `SetupBoneMenuCore()`, add:
+
+```csharp
+page.CreateBool(
+    "Debug Simple Joint Targets",
+    Color.cyan,
+    false,
+    v => DebugSimpleJointTargets = v
+);
+```
+
+This is a diagnostic switch. If enabling this calms the legs dramatically, the current `ComputeJointTargetRotation` conversion is the primary culprit.
+
+---
+
+## B. Fix FixedUpdate order
+
+Your current order is:
+
+```csharp
+StateMachine.Tick();
+StateMachine.TickKick();
+LegPoses.Tick();
+JointControl.Tick();
+Stabilizer.Tick();
+ObstacleClearance.Tick();
+```
+
+Problems:
+
+- `LegPoses` reads obstacle clearance before it has ticked this frame.
+- `JointControl` may restore drives after `LegPoses` has already written targets.
+- Leaving ragdoll can apply pose targets while still on last frame’s limp drives.
+
+Change `OnFixedUpdate()` to this order:
+
+```csharp
+public override void OnFixedUpdate()
+{
+    if (!ModEnabled) return;
+
+    CheckAvatarChanged();
+    TryCacheRig();
+
+    if (CachedRig == null) return;
+
+    StateMachine.OnContactsUpdate(ContactHasGround, ContactHasWall, ContactWallNormal);
+    ClearContacts();
+
+    JointControl.CacheJointDrives();
+
+    StateMachine.Tick();
+    StateMachine.TickKick();
+
+    // Clearance should update before leg pose reads it.
+    ObstacleClearance.Tick();
+
+    // Restore/drive parameters before pose targets are written.
+    JointControl.Tick();
+
+    LegPoses.Tick();
+    Stabilizer.Tick();
+
+    SanitizePhysics();
+
+    Input.ConsumeOneShots();
+    TickDiagnostics();
+}
+```
+
+---
+
+## C. Cache spine more safely
+
+This block is risky:
+
+```csharp
+var spineJoint = CachedPelvisRb.GetComponentInChildren<ConfigurableJoint>();
+if (spineJoint != null && spineJoint.connectedBody != null)
+    CachedSpineRb = spineJoint.connectedBody;
+```
+
+Depending on hierarchy order, that can grab a hip/knee/thigh joint and make `CachedSpineRb` something that is not the spine. If the stabilizer then applies torque to the wrong body, the whole body/legs can fight.
+
+Replace that spine caching section in `TryCacheRig()` with:
+
+```csharp
+CachedSpineRb = FindSpineRigidbody();
+if (CachedSpineRb == null)
+    CachedSpineRb = CachedPelvisRb;
+
+JointControl.CacheJointDrives();
+
+// New: cache lower-body colliders for proper friction restore.
+ObstacleClearance.CacheSlideColliders();
+```
+
+Then add this helper to `PayneLabMod`:
+
+```csharp
+private Rigidbody FindSpineRigidbody()
+{
+    if (CachedRig == null || CachedPelvisRb == null)
+        return null;
+
+    var joints = CachedRig.GetComponentsInChildren<ConfigurableJoint>();
+
+    // Prefer a spine/chest/torso joint whose connected body is the pelvis.
+    // The Rigidbody on that joint object is usually the spine body.
+    for (int i = 0; i < joints.Length; i++)
+    {
+        var j = joints[i];
+        if (j == null) continue;
+
+        string n = j.gameObject.name.ToLower();
+
+        if ((n.Contains("spine") || n.Contains("chest") || n.Contains("torso")) &&
+            j.connectedBody == CachedPelvisRb)
+        {
+            var rb = j.GetComponent<Rigidbody>();
+            if (rb != null) return rb;
+        }
+    }
+
+    // Fallback: any spine/chest/torso joint's connected body, if it does not look like a leg.
+    for (int i = 0; i < joints.Length; i++)
+    {
+        var j = joints[i];
+        if (j == null || j.connectedBody == null) continue;
+
+        string n = j.gameObject.name.ToLower();
+
+        if (n.Contains("hip") || n.Contains("thigh") || n.Contains("leg") ||
+            n.Contains("knee") || n.Contains("calf") || n.Contains("shin") ||
+            n.Contains("foot"))
+        {
+            continue;
+        }
+
+        if (n.Contains("spine") || n.Contains("chest") || n.Contains("torso"))
+        {
+            return j.connectedBody;
+        }
+    }
+
+    return null;
+}
+```
+
+---
+
+## D. Use SlideFriction setting instead of hard-zero for slide states
+
+In `SetState`, you currently do:
+
+```csharp
+if (enteringSlide)
+{
+    ObstacleClearance.SetSlideFriction(0f);
+}
+```
+
+Change that to:
+
+```csharp
+if (enteringSlide)
+{
+    ObstacleClearance.SetSlideFriction(SlideFriction);
+}
+```
+
+Keep wall-run entry at `0f` if you want wall-run to remain zero friction.
+
+This alone can reduce overly slippery prone/dive behavior.
+
+---
+
+## E. Clear obstacle collider cache on invalidate
+
+In `InvalidateCache()`, change this:
+
+```csharp
+try
+{
+    ObstacleClearance?.RestoreFriction();
+}
+catch (System.Exception)
+{
+}
+```
+
+to:
+
+```csharp
+try
+{
+    ObstacleClearance?.RestoreFriction();
+    ObstacleClearance?.ClearColliderCache();
+}
+catch (System.Exception)
+{
+}
+```
+
+---
+
+# 2. PayneLabObstacleClearance.cs changes
+
+This file needs a fairly important fix.
+
+Right now `RestoreFriction()` assigns a new `PhysicMaterial` with no explicitly configured friction. That can permanently alter lower-body collider friction after slides/dives. Instead, store the original materials and restore them.
+
+Add this import at the top:
+
+```csharp
+using System.Collections.Generic;
+```
+
+Add these fields inside `PayneLabObstacleClearance`:
+
+```csharp
+private readonly List<Collider> _slideColliders = new List<Collider>();
+private readonly Dictionary<Collider, PhysicMaterial> _originalMaterials =
+    new Dictionary<Collider, PhysicMaterial>();
+
+private bool _collidersCached;
+```
+
+Add these methods:
+
+```csharp
+public void CacheSlideColliders()
+{
+    _slideColliders.Clear();
+    _originalMaterials.Clear();
+    _collidersCached = true;
+
+    var rig = _mod.CachedRig;
+    if (rig == null) return;
+
+    AddSlideCollider(_mod.CachedPelvisRb);
+    AddSlideCollider(_mod.CachedKneeRb);
+    AddSlideCollider(_mod.CachedFootRb);
+
+    var cols = rig.GetComponentsInChildren<Collider>();
+
+    for (int i = 0; i < cols.Length; i++)
+    {
+        var c = cols[i];
+        if (c == null) continue;
+
+        string n = c.gameObject.name.ToLower();
+
+        if (n.Contains("knee") ||
+            n.Contains("foot") ||
+            n.Contains("ankle") ||
+            n.Contains("shin") ||
+            n.Contains("calf") ||
+            n.Contains("thigh") ||
+            n.Contains("leg"))
+        {
+            AddSlideCollider(c);
+        }
+    }
+}
+
+public void ClearColliderCache()
+{
+    _slideColliders.Clear();
+    _originalMaterials.Clear();
+    _collidersCached = false;
+}
+
+private void AddSlideCollider(Rigidbody rb)
+{
+    if (rb == null) return;
+    AddSlideCollider(rb.GetComponent<Collider>());
+}
+
+private void AddSlideCollider(Collider c)
+{
+    if (c == null) return;
+
+    if (!_slideColliders.Contains(c))
+        _slideColliders.Add(c);
+}
+```
+
+Replace `SetSlideFriction` with:
+
+```csharp
+public void SetSlideFriction(float friction)
+{
+    if (_mod.CachedRig == null) return;
+
+    if (!_collidersCached)
+        CacheSlideColliders();
+
+    float f = Mathf.Clamp(friction, 0f, MaxMaterialFriction);
+
+    var mat = TrySetSlideFriction(f);
+    if (mat == null) return;
+
+    for (int i = 0; i < _slideColliders.Count; i++)
+    {
+        var c = _slideColliders[i];
+        if (c == null) continue;
+
+        try
+        {
+            if (!_originalMaterials.ContainsKey(c))
+                _originalMaterials[c] = c.material;
+
+            c.material = mat;
+        }
+        catch (System.Exception)
+        {
+        }
+    }
+}
+```
+
+Replace `RestoreFriction` with:
+
+```csharp
+public void RestoreFriction()
+{
+    if (_mod.CachedRig == null) return;
+
+    for (int i = 0; i < _slideColliders.Count; i++)
+    {
+        var c = _slideColliders[i];
+        if (c == null) continue;
+
+        try
+        {
+            if (_originalMaterials.TryGetValue(c, out PhysicMaterial original) &&
+                original != null)
+            {
+                c.material = original;
+            }
+        }
+        catch (System.Exception)
+        {
+        }
+    }
+
+    _originalMaterials.Clear();
+}
+```
+
+Now replace `Tick()` with a much safer version:
+
+```csharp
+public void Tick()
+{
+    // Currently only KneeSlide actually uses knee clearance.
+    // Disable clearance in DiveProne/SideLying until the leg targeting is stable.
+    if (_mod.CurrentState != StuntState.KneeSlide)
+    {
+        _kneeClearanceOffset = Mathf.Lerp(_kneeClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        _footClearanceOffset = Mathf.Lerp(_footClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        return;
+    }
+
+    var rig = _mod.CachedRig;
+    if (rig == null) return;
+
+    Vector3 velocity = _mod.CachedPelvisRb != null ? _mod.CachedPelvisRb.velocity : Vector3.zero;
+    if (!PayneLabUtils.IsFinite(velocity)) velocity = Vector3.zero;
+
+    float speed = new Vector2(velocity.x, velocity.z).magnitude;
+
+    if (speed < 0.5f)
+    {
+        _kneeClearanceOffset = Mathf.Lerp(_kneeClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        _footClearanceOffset = Mathf.Lerp(_footClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+        return;
+    }
+
+    Vector3 moveDir = new Vector3(velocity.x, 0f, velocity.z).normalized;
+    float probeDist = 0.35f + speed * 0.08f;
+
+    bool obstacleAhead = false;
+
+    var knees = _mod.JointControl != null ? _mod.JointControl.KneeJoints : null;
+
+    if (knees != null && knees.Length > 0)
+    {
+        for (int i = 0; i < knees.Length; i++)
+        {
+            var knee = knees[i];
+            if (knee == null) continue;
+
+            var rb = knee.GetComponent<Rigidbody>();
+            Vector3 kneePos = rb != null ? rb.position : knee.position;
+
+            if (!PayneLabUtils.IsFinite(kneePos)) continue;
+
+            RaycastHit hit;
+            if (PayneLabUtils.RaycastNonSelf(_mod, kneePos, moveDir, out hit, probeDist))
+            {
+                if (IsObstacleHit(hit, kneePos))
+                {
+                    obstacleAhead = true;
+                    break;
+                }
+            }
+        }
+    }
+    else if (_mod.CachedKneeRb != null)
+    {
+        Vector3 kneePos = _mod.CachedKneeRb.position;
+
+        if (PayneLabUtils.IsFinite(kneePos))
+        {
+            RaycastHit hit;
+            if (PayneLabUtils.RaycastNonSelf(_mod, kneePos, moveDir, out hit, probeDist))
+            {
+                if (IsObstacleHit(hit, kneePos))
+                    obstacleAhead = true;
+            }
+        }
+    }
+
+    _kneeClearanceOffset = Mathf.Lerp(
+        _kneeClearanceOffset,
+        obstacleAhead ? 10f : 0f,
+        Time.fixedDeltaTime * (obstacleAhead ? 6f : 8f)
+    );
+
+    // Foot clearance is currently unused by LegPoses.
+    // Keep it decayed so it does not accumulate stale values.
+    _footClearanceOffset = Mathf.Lerp(_footClearanceOffset, 0f, Time.fixedDeltaTime * 8f);
+}
+
+private bool IsObstacleHit(RaycastHit hit, Vector3 origin)
+{
+    // Ignore floor-ish hits.
+    // Only count reasonably vertical/wall-like surfaces that are actually above the knee.
+    float obstacleHeight = hit.point.y - origin.y;
+
+    return obstacleHeight > 0.10f && Mathf.Abs(hit.normal.y) < 0.45f;
+}
+```
+
+This removes a lot of false-positive knee lift.
+
+---
+
+# 3. PayneLabStateMachine.cs changes
+
+## A. Add dive airborne lock
+
+Add these fields:
+
+```csharp
+private float _diveAirborneLock;
+
+public bool DiveAirborneLock => _diveAirborneLock > 0f;
+```
+
+In `Tick()`, near where you decrement `_actionLockTimer`, add:
+
+```csharp
+if (_diveAirborneLock > 0f)
+    _diveAirborneLock -= Time.fixedDeltaTime;
+```
+
+---
+
+## B. Make `IsGrounded()` less permissive
+
+Replace `IsGrounded()` with:
+
+```csharp
+public bool IsGrounded()
+{
+    Vector3 vel = GetVelocity();
+
+    bool vyCalm =
+        vel.y <= GroundedUpBound &&
+        vel.y >= GroundedDownBound;
+
+    // Contact is authoritative, but do not let a tiny foot/knee scuff
+    // count as grounded while the body is still moving vertically fast.
+    if (_contactGrounded)
+    {
+        if (!vyCalm)
+        {
+            _groundedVelTimer = 0f;
+            return false;
+        }
+
+        _groundedVelTimer += Time.fixedDeltaTime;
+        return _groundedVelTimer >= 0.05f;
+    }
+
+    if (!vyCalm)
+    {
+        _groundedVelTimer = 0f;
+        return false;
+    }
+
+    _groundedVelTimer += Time.fixedDeltaTime;
+    return _groundedVelTimer >= GroundedVFactor;
+}
+```
+
+This should reduce dive mode immediately deciding it is grounded.
+
+---
+
+## C. Replace dive impulse with velocity-target dive
+
+Your current dive impulse can be extremely large:
+
+```csharp
+(_mod.DiveImpulseForce * 25f) * m
+```
+
+With default `DiveImpulseForce = 8`, that is a huge impulse and can explode the ragdoll/joints.
+
+Replace `ExecuteDive()` with this safer version:
+
+```csharp
+private void ExecuteDive()
+{
+    var rig = _mod.CachedRig;
+    if (rig == null) return;
+
+    CaptureEntryMomentum();
+
+    rig.PhysicalLegs();
+    rig.DisableBallLoco();
+
+    Vector3 headFwd = GetFacingDirection();
+    Vector3 headRight = Vector3.Cross(Vector3.up, headFwd).normalized;
+
+    Vector2 ls = _mod.Input.LeftStick;
+
+    Vector3 horizontalDir = headFwd;
+
+    if (ls.sqrMagnitude > 0.1f)
+    {
+        horizontalDir = (headFwd * ls.y + headRight * ls.x).normalized;
+    }
+
+    if (horizontalDir.sqrMagnitude < 0.001f)
+        horizontalDir = headFwd;
+
+    horizontalDir.Normalize();
+
+    var rb = _mod.CachedPelvisRb;
+
+    if (rb != null && PayneLabUtils.IsFinite(rb.velocity))
+    {
+        Vector3 currentVel = rb.velocity;
+        Vector3 currentFlat = new Vector3(currentVel.x, 0f, currentVel.z);
+
+        float currentSpeed = currentFlat.magnitude;
+        float entrySpeed = new Vector2(_entryVelocity.x, _entryVelocity.z).magnitude;
+
+        // DiveImpulseForce now behaves like target horizontal speed in m/s.
+        float diveSpeed = Mathf.Clamp(_mod.DiveImpulseForce, 1f, 20f);
+
+        float desiredSpeed = Mathf.Max(currentSpeed, entrySpeed, diveSpeed);
+
+        Vector3 desiredVel = horizontalDir * desiredSpeed;
+
+        // Small upward pop, but not enough to slam the solver.
+        desiredVel.y = Mathf.Max(
+            currentVel.y,
+            Mathf.Min(2.5f, desiredSpeed * 0.15f)
+        );
+
+        Vector3 delta = desiredVel - currentVel;
+
+        if (PayneLabUtils.IsFinite(delta))
+        {
+            // Prevent absurd single-frame velocity changes.
+            delta = Vector3.ClampMagnitude(delta, 12f);
+            rb.AddForce(delta, ForceMode.VelocityChange);
+        }
+    }
+
+    _mod.ActiveInput = InputMode.ProcLeg;
+    _mod.SetState(StuntState.DiveProne);
+
+    _actionLockTimer = 0.6f;
+    _diveAirborneLock = 0.35f;
+
+    _groundedVelTimer = 0f;
+    _airborneFrames = 0;
+
+    _mod.LoggerInstance.Msg(
+        $"[PayneLab] Directional Dive: dir=({horizontalDir.x:0.00},{horizontalDir.z:0.00})"
+    );
+}
+```
+
+Important: after this change, `DiveImpulseForce` should be thought of as **target dive speed in m/s**, not raw impulse. Default `8` becomes much saner.
+
+---
+
+# 4. PayneLabJointControl.cs changes
+
+## A. Add explicit left/right joints
+
+Add these fields:
+
+```csharp
+internal ConfigurableJoint HipLeft;
+internal ConfigurableJoint HipRight;
+internal ConfigurableJoint KneeLeft;
+internal ConfigurableJoint KneeRight;
+```
+
+In `InvalidateCache()`, clear them:
+
+```csharp
+HipLeft = null;
+HipRight = null;
+KneeLeft = null;
+KneeRight = null;
+```
+
+In `CacheJointDrives()`, replace the beginning hip/knee collection part with:
+
+```csharp
+HipLeft = GetJointOrNull(rig.m_hipLf);
+HipRight = GetJointOrNull(rig.m_hipRt);
+KneeLeft = GetJointOrNull(rig.m_kneeLf);
+KneeRight = GetJointOrNull(rig.m_kneeRt);
+
+var hips = new List<ConfigurableJoint>();
+var knees = new List<ConfigurableJoint>();
+
+AddUnique(hips, HipLeft);
+AddUnique(hips, HipRight);
+AddUnique(knees, KneeLeft);
+AddUnique(knees, KneeRight);
+
+if (hips.Count < 2) AddRangeUnique(hips, GetJointsByName(rig, "hip", "thigh", "leg"));
+if (knees.Count < 2) AddRangeUnique(knees, GetJointsByName(rig, "knee", "calf", "shin"));
+
+HipJoints = hips.Count > 0 ? hips.ToArray() : null;
+KneeJoints = knees.Count > 0 ? knees.ToArray() : null;
+```
+
+This gives `LegPoses` reliable left/right targets.
+
+---
+
+## B. Make drive smoothing continuous and stop fighting FullIK
+
+Replace `Tick()` with:
+
+```csharp
+public void Tick()
+{
+    // FullIK: do not fight the game's IK.
+    if (_mod.ActiveInput == InputMode.FullIK)
+    {
+        if (_limpApplied)
+        {
+            RestoreFullBodyDrives();
+            _limpApplied = false;
+        }
+
+        return;
+    }
+
+    if (_mod.ActiveInput == InputMode.FullRagdoll)
+    {
+        ApplyFullBodyLimp();
+        _limpApplied = true;
+        return;
+    }
+
+    if (_limpApplied)
+    {
+        RestoreFullBodyDrives();
+        _limpApplied = false;
+    }
+
+    // Continuously smooth toward the state's target drive parameters.
+    ApplyStateDriveParams(_mod.CurrentState);
+
+    var rb = _mod.CachedPelvisRb;
+    if (rb == null) return;
+
+    bool isGrounded = _mod.StateMachine != null && _mod.StateMachine.IsGrounded();
+
+    bool diveAirborneAssist =
+        _mod.CurrentState == StuntState.DiveProne &&
+        _mod.StateMachine != null &&
+        _mod.StateMachine.DiveAirborneLock;
+
+    // Aerial / dive orientation via Right Stick.
+    if ((!isGrounded || diveAirborneAssist) &&
+        (_mod.CurrentState == StuntState.Aerial ||
+         _mod.CurrentState == StuntState.Cannonball ||
+         _mod.CurrentState == StuntState.DiveProne))
+    {
+        ApplyAerialTorque();
+    }
+
+    // For leg stability, remove prone/side-lying barrel-roll torque for now.
+    // Keep it only in explicit rolling/sliding states.
+    if (_mod.CurrentState == StuntState.GroundRoll ||
+        _mod.CurrentState == StuntState.KneeSlide ||
+        _mod.CurrentState == StuntState.ButtSlide)
+    {
+        ApplyGroundRollTorque();
+    }
+}
+```
+
+This is important:
+
+- Drives now smooth continuously.
+- FullIK no longer gets joint torque/drive interference.
+- DiveProne gets short aerial RS assist after a dive.
+- Prone/side-lying no longer get accidental LS barrel-roll torque.
+
+---
+
+## C. Make full ragdoll limp more explicit
+
+Replace `ApplyFullBodyLimp()` with:
+
+```csharp
+private void ApplyFullBodyLimp()
+{
+    if (!_snapshotTaken || _allJoints == null) return;
+
+    for (int i = 0; i < _allJoints.Length; i++)
+    {
+        var joint = _allJoints[i];
+        if (joint == null) continue;
+
+        joint.rotationDriveMode = RotationDriveMode.Slerp;
+
+        JointDrive drive = joint.slerpDrive;
+
+        drive.positionSpring = 30f;
+        drive.positionDamper = 12f;
+        drive.maximumForce = 150f;
+
+        joint.slerpDrive = drive;
+    }
+}
+```
+
+This makes ragdoll more consistently limp across joints.
+
+---
+
+## D. Reduce aerial/ground roll torque aggression
+
+Replace these constants:
+
+```csharp
+private const float AerialTorqueGain = 10f;
+private const float MaxAerialAngularAccel = 300f;
+private const float GroundRollTorqueGain = 10f;
+private const float MaxGroundRollAngularAccel = 300f;
+```
+
+with:
+
+```csharp
+private const float AerialTorqueGain = 6f;
+private const float MaxAerialAngularAccel = 120f;
+
+private const float GroundRollTorqueGain = 6f;
+private const float MaxGroundRollAngularAccel = 120f;
+```
+
+Then replace `ApplyAerialTorque()` with:
+
+```csharp
+private void ApplyAerialTorque()
+{
+    var rb = _mod.CachedPelvisRb;
+    if (rb == null) return;
+
+    if (!PayneLabUtils.IsFinite(rb.position) ||
+        !PayneLabUtils.IsFinite(rb.velocity) ||
+        !PayneLabUtils.IsFinite(rb.angularVelocity))
+    {
+        return;
+    }
+
+    Vector2 rs = _mod.Input.RightStick;
+
+    Vector3 currentLocalAngVel =
+        rb.transform.InverseTransformDirection(rb.angularVelocity);
+
+    if (rs.sqrMagnitude < 0.02f)
+    {
+        // Gentle damping only when stick is released.
+        Vector3 dampingTorque = -currentLocalAngVel * 2f;
+        dampingTorque = Vector3.ClampMagnitude(dampingTorque, 40f);
+
+        if (dampingTorque.sqrMagnitude > 0.01f)
+            rb.AddRelativeTorque(dampingTorque, ForceMode.Acceleration);
+
+        return;
+    }
+
+    Vector3 desiredLocalAngVel = new Vector3(
+        rs.y * _mod.AerialFlipTorque,
+        0f,
+        -rs.x * _mod.AerialFlipTorque
+    );
+
+    Vector3 error = desiredLocalAngVel - currentLocalAngVel;
+
+    Vector3 localTorque = Vector3.ClampMagnitude(
+        error * AerialTorqueGain,
+        MaxAerialAngularAccel
+    );
+
+    if (localTorque.sqrMagnitude > 0.01f)
+    {
+        rb.AddRelativeTorque(localTorque, ForceMode.Acceleration);
+    }
+}
+```
+
+This prevents the right stick from becoming a hard angular brake when released.
+
+---
+
+# 5. PayneLabLegPoses.cs changes
+
+This is the most important file for the actual “legs are crazy” symptom.
+
+## A. Lower pose slew rate
+
+Replace:
+
+```csharp
+private const float MaxPoseSlewRate = 420f;
+```
+
+with:
+
+```csharp
+private const float MaxHipSlewRate = 180f;
+private const float MaxKneeSlewRate = 140f;
+```
+
+Then replace the slew block inside `Tick()` with:
+
+```csharp
+if (!_poseInitialized)
+{
+    _curLeftHip = LeftHipTarget;
+    _curRightHip = RightHipTarget;
+    _curLeftKnee = LeftKneeTarget;
+    _curRightKnee = RightKneeTarget;
+
+    _poseInitialized = true;
+}
+else
+{
+    float hipStep = MaxHipSlewRate * Time.fixedDeltaTime;
+    float kneeStep = MaxKneeSlewRate * Time.fixedDeltaTime;
+
+    _curLeftHip = Quaternion.RotateTowards(_curLeftHip, LeftHipTarget, hipStep);
+    _curRightHip = Quaternion.RotateTowards(_curRightHip, RightHipTarget, hipStep);
+    _curLeftKnee = Quaternion.RotateTowards(_curLeftKnee, LeftKneeTarget, kneeStep);
+    _curRightKnee = Quaternion.RotateTowards(_curRightKnee, RightKneeTarget, kneeStep);
+}
+```
+
+---
+
+## B. Add quaternion sanity checks
+
+Add this helper to `PayneLabLegPoses`:
+
+```csharp
+private static bool IsValidQuaternion(Quaternion q)
+{
+    return float.IsFinite(q.x) &&
+           float.IsFinite(q.y) &&
+           float.IsFinite(q.z) &&
+           float.IsFinite(q.w);
+}
+```
+
+Inside `Tick()`, just before the slew block, add:
+
+```csharp
+if (!IsValidQuaternion(LeftHipTarget)) LeftHipTarget = Quaternion.identity;
+if (!IsValidQuaternion(RightHipTarget)) RightHipTarget = Quaternion.identity;
+if (!IsValidQuaternion(LeftKneeTarget)) LeftKneeTarget = Quaternion.identity;
+if (!IsValidQuaternion(RightKneeTarget)) RightKneeTarget = Quaternion.identity;
+
+if (!IsValidQuaternion(_curLeftHip)) _curLeftHip = Quaternion.identity;
+if (!IsValidQuaternion(_curRightHip)) _curRightHip = Quaternion.identity;
+if (!IsValidQuaternion(_curLeftKnee)) _curLeftKnee = Quaternion.identity;
+if (!IsValidQuaternion(_curRightKnee)) _curRightKnee = Quaternion.identity;
+```
+
+---
+
+## C. Use explicit left/right joints when available
+
+Replace `ApplyPoseToJoints()` with:
+
+```csharp
+private void ApplyPoseToJoints()
+{
+    float bendSign = _mod.LegBendInvert ? -1f : 1f;
+    var jc = _mod.JointControl;
+
+    bool explicitJoints =
+        jc.HipLeft != null &&
+        jc.HipRight != null &&
+        jc.KneeLeft != null &&
+        jc.KneeRight != null;
+
+    if (explicitJoints)
+    {
+        jc.HipLeft.targetRotation =
+            ComputeJointTargetRotation(jc.HipLeft, ApplyBendSign(_curLeftHip, bendSign));
+
+        jc.HipRight.targetRotation =
+            ComputeJointTargetRotation(jc.HipRight, ApplyBendSign(_curRightHip, bendSign));
+
+        jc.KneeLeft.targetRotation =
+            ComputeJointTargetRotation(jc.KneeLeft, ApplyBendSign(_curLeftKnee, bendSign));
+
+        jc.KneeRight.targetRotation =
+            ComputeJointTargetRotation(jc.KneeRight, ApplyBendSign(_curRightKnee, bendSign));
+
+        return;
+    }
+
+    // Fallback for rigs where explicit bones were unavailable.
+    var hips = jc.HipJoints;
+    var knees = jc.KneeJoints;
+
+    if (hips != null)
+    {
+        for (int i = 0; i < hips.Length; i++)
+        {
+            var joint = hips[i];
+            if (joint == null) continue;
+
+            bool isLeft = IsLeftJoint(joint, i);
+            Quaternion target = isLeft ? _curLeftHip : _curRightHip;
+
+            joint.targetRotation =
+                ComputeJointTargetRotation(joint, ApplyBendSign(target, bendSign));
+        }
+    }
+
+    if (knees != null)
+    {
+        for (int i = 0; i < knees.Length; i++)
+        {
+            var joint = knees[i];
+            if (joint == null) continue;
+
+            bool isLeft = IsLeftJoint(joint, i);
+            Quaternion target = isLeft ? _curLeftKnee : _curRightKnee;
+
+            joint.targetRotation =
+                ComputeJointTargetRotation(joint, ApplyBendSign(target, bendSign));
+        }
+    }
+}
+```
+
+This prevents left/right misassignment on avatars with weird names.
+
+---
+
+## D. Clamp knee clearance
+
+In `ComputeKneeSlidePose()`, change:
+
+```csharp
+float kneeClearance = _mod.ObstacleClearance != null ? _mod.ObstacleClearance.GetKneeClearance() : 0f;
+```
+
+to:
+
+```csharp
+float kneeClearance = 0f;
+
+if (_mod.ObstacleClearance != null)
+{
+    kneeClearance = Mathf.Clamp(_mod.ObstacleClearance.GetKneeClearance(), 0f, 10f);
+}
+```
+
+---
+
+## E. Stop right-stick yaw from pumping prone knees
+
+Replace `GetProneTuckBlend()` with:
+
+```csharp
+private float GetProneTuckBlend(float settleRate)
+{
+    var rb = _mod.CachedSpineRb ?? _mod.CachedPelvisRb;
+    if (rb == null) return 0f;
+
+    // If the player is actively using right stick control, do not let the
+    // resulting angular velocity make the knees pump.
+    if (_mod.Input != null && _mod.Input.RightStick.sqrMagnitude > 0.04f)
+    {
+        _proneTuckBlend = Mathf.MoveTowards(
+            _proneTuckBlend,
+            0f,
+            Time.fixedDeltaTime * settleRate
+        );
+
+        return _proneTuckBlend;
+    }
+
+    Vector3 angVel = rb.angularVelocity;
+    if (!PayneLabUtils.IsFinite(angVel)) angVel = Vector3.zero;
+
+    float yawRate = Mathf.Abs(angVel.y);
+
+    // Much less eager than before.
+    float target = Mathf.Clamp01((yawRate - 3.0f) / 4.0f);
+
+    float blend = _proneTuckBlend;
+    float step = Time.fixedDeltaTime * settleRate;
+
+    if (target > blend)
+        _proneTuckBlend = Mathf.MoveTowards(blend, target, step * 1.5f);
+    else
+        _proneTuckBlend = Mathf.MoveTowards(blend, target, step);
+
+    return _proneTuckBlend;
+}
+```
+
+This is very important for future RS omnidirectional prone control.
+
+---
+
+## F. Add diagnostic bypass for joint target conversion
+
+Replace `ComputeJointTargetRotation()` with:
+
+```csharp
+private Quaternion ComputeJointTargetRotation(ConfigurableJoint joint, Quaternion desiredPose)
+{
+    if (joint == null) return Quaternion.identity;
+
+    if (!IsValidQuaternion(desiredPose))
+        desiredPose = Quaternion.identity;
+
+    // Diagnostic mode:
+    // If this calms the legs, the joint-space conversion below is the main issue.
+    if (_mod.DebugSimpleJointTargets)
+    {
+        return Quaternion.Inverse(desiredPose);
+    }
+
+    Quaternion inv = Quaternion.Inverse(desiredPose);
+
+    Vector3 right = joint.axis;
+    Vector3 forward = Vector3.Cross(joint.axis, joint.secondaryAxis);
+
+    if (forward.sqrMagnitude < 0.0001f)
+    {
+        return inv;
+    }
+
+    forward.Normalize();
+
+    Vector3 up = Vector3.Cross(forward, right).normalized;
+    Quaternion jointSpace = Quaternion.LookRotation(forward, up);
+
+    return Quaternion.Inverse(jointSpace) * inv * jointSpace;
+}
+```
+
+Test this toggle:
+
+- If legs calm down with `Debug Simple Joint Targets = true`, the old conversion is avatar-axis-dependent and wrong for that rig.
+- If legs get worse, set it back to false.
+
+Long term, we should replace this with per-joint calibration instead of a generic axis conversion.
+
+---
+
+# 6. PayneLabStabilizer.cs changes
+
+## A. Disable stabilizer in FullIK
+
+Replace the beginning of `Tick()`:
+
+```csharp
+if (_mod.ActiveInput == InputMode.FullRagdoll) return;
+```
+
+with:
+
+```csharp
+if (_mod.ActiveInput != InputMode.ProcLeg) return;
+```
+
+That disables stabilizer in both `FullRagdoll` and `FullIK`.
+
+---
+
+## B. Reduce slow aim roll damping and guard it
+
+Change:
+
+```csharp
+private const float AimRollDamping = 40f;
+```
+
+to:
+
+```csharp
+private const float AimRollDamping = 15f;
+```
+
+Then replace `ApplySlowAimRollDamping()` with:
+
+```csharp
+private void ApplySlowAimRollDamping()
+{
+    if (_mod.CurrentState != StuntState.SideLying &&
+        _mod.CurrentState != StuntState.DiveProne)
+    {
+        return;
+    }
+
+    // Do not fight active right-stick orientation input.
+    if (_mod.Input != null && _mod.Input.RightStick.sqrMagnitude > 0.04f)
+        return;
+
+    var rb = _mod.CachedPelvisRb ?? _mod.CachedSpineRb;
+    if (rb == null) return;
+
+    Vector3 flatVel = new Vector3(rb.velocity.x, 0f, rb.velocity.z);
+
+    if (!PayneLabUtils.IsFinite(rb.velocity) || flatVel.magnitude > AimRollSpeedThreshold)
+        return;
+
+    var spine = _mod.CachedSpineRb ?? rb;
+
+    Vector3 rollAxis = spine.transform.forward;
+    if (!PayneLabUtils.IsFinite(rollAxis) || rollAxis.sqrMagnitude < 0.001f)
+        return;
+
+    Vector3 angVel = spine.angularVelocity;
+    if (!PayneLabUtils.IsFinite(angVel)) return;
+
+    float spin = Vector3.Dot(angVel, rollAxis);
+
+    if (Mathf.Abs(spin) < 0.01f) return;
+
+    spine.AddTorque(-rollAxis * (spin * AimRollDamping), ForceMode.Acceleration);
+}
+```
+
+---
+
+# 7. Recommended first test settings
+
+After applying the above, test with these BoneMenu values:
+
+```text
+Enabled: true
+Stabilizer Spring: 800
+Stabilizer Damping: 80
+Stabilizer Max Torque: 150 to 250
+Joint Spring Mult: 0.8
+Aerial Flip Torque: 8 to 12
+Ground Roll Torque: 6 to 8
+Dive Impulse: 6 to 9
+Slide Friction: 0.05 to 0.15
+Invert Leg Bend: default false unless needed
+Diagnostics: true
+Debug Simple Joint Targets: first test false, then true
+```
+
+Test order:
+
+1. Standing idle.
+2. Walk/run into knee slide.
+3. Dive from standing.
+4. Dive while airborne with RS.
+5. Ragdoll toggle.
+6. Get-up.
+7. Side lying / prone.
+
+---
+
+# 8. What to look for after this patch
+
+If the legs are much calmer but still twitch during state transitions, lower these further:
+
+```csharp
+MaxHipSlewRate = 140f;
+MaxKneeSlewRate = 110f;
+```
+
+And reduce state drive values, especially:
+
+```csharp
+KneeSlide kneeSpring
+Standing kneeSpring
+DiveProne kneeSpring
+```
+
+If the legs become calm only when `Debug Simple Joint Targets` is enabled, then the next real task is rebuilding `ComputeJointTargetRotation` properly using:
+
+- initial joint local rotation
+- per-joint bend axis
+- per-joint sign
+- left/right calibration
+- angle limits
+
+That will be the permanent fix for avatar-dependent leg explosions.
+
+---
+
+# 9. About omnidirectional diving/proning with RS
+
+Do not build full RS omnidirectional prone control until the legs are stable.
+
+The current RS torque is angular-velocity-based and only controls pitch/roll, not yaw. For proper omnidirectional prone/diving, you eventually want a separate controller that does this:
+
+- RS direction defines desired body heading relative to camera/head.
+- Apply PD torque around world-up for yaw.
+- Apply limited pitch torque only when not pressed into the floor.
+- Do **not** make knee targets react to the resulting angular velocity.
+- Keep prone leg targets very soft and mostly passive.
+
+But first, stabilize the legs with the patch set above.
+
+The biggest immediate red flags from the full file set are the friction restore issue, the overly permissive grounded contact check, the huge dive impulse, and the joint target conversion.
