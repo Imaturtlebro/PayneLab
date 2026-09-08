@@ -116,6 +116,17 @@ namespace PayneLab
                 return PayneLabUtils.IsFinite(v) ? v.y : 0f;
             }
         }
+        
+        // Expose get-up timer for leg pose animation blending
+        public float GetUpProgress
+        {
+            get
+            {
+                if (!_isGettingUp) return 1f;
+                // Normalize get-up timer to 0-1 range over the total duration
+                return Mathf.Clamp01(_getUpTimer / GetUpTotalDuration);
+            }
+        }
 
         public PayneLabStateMachine(PayneLabMod mod) { _mod = mod; }
 
