@@ -167,7 +167,7 @@ namespace PayneLab
 
             bool isGrounded = _mod.StateMachine != null && _mod.StateMachine.IsGrounded();
 
-            // Aerial flips via Right Stick: strictly allowed only when airborne.
+            // Aerial rotation controls (RS steering/tilt + LS flips/barrel rolls): strictly allowed only when airborne.
             // When touching ground in DiveProne, aerial torque is disabled so the torso
             // is never forced into the ground geometry.
             if (!isGrounded &&
@@ -179,11 +179,14 @@ namespace PayneLab
             }
 
             // Ground / dive barrel roll via Left Stick X (roll about spine forward axis)
+            // Also applies during aerial states for continuous roll control
             if (_mod.CurrentState == StuntState.GroundRoll ||
                 _mod.CurrentState == StuntState.KneeSlide ||
                 _mod.CurrentState == StuntState.ButtSlide ||
                 _mod.CurrentState == StuntState.SideLying ||
-                _mod.CurrentState == StuntState.DiveProne)
+                _mod.CurrentState == StuntState.DiveProne ||
+                _mod.CurrentState == StuntState.Aerial ||
+                _mod.CurrentState == StuntState.Cannonball)
             {
                 ApplyGroundRollTorque();
             }
@@ -195,15 +198,61 @@ namespace PayneLab
         {
             if (!_snapshotTaken || _allJoints == null) return;
 
+            // RAGDOLL MODE: Stiffer legs to prevent "spaghetti" flopping
+            // Upper body stays loose for natural physics reaction, but legs hold some shape
+            const float upperBodySpring = 40f;
+            const float upperBodyDamper = 15f;
+            const float upperBodyMaxForce = 250f;
+            
+            const float legSpring = 1200f;    // Much stiffer for legs
+            const float legDamper = 35f;      // Moderate damping
+            const float legMaxForce = 1800f;  // High force limit to maintain pose
+
             for (int i = 0; i < _allJoints.Length; i++)
             {
                 var joint = _allJoints[i];
                 if (joint == null) continue;
 
+                string name = joint.gameObject.name.ToLower();
+                bool isLegJoint = name.Contains("hip") || name.Contains("thigh") || 
+                                  name.Contains("knee") || name.Contains("calf") || 
+                                  name.Contains("shin") || name.EndsWith("l") || 
+                                  name.EndsWith("r");
+                
+                // Check if this is actually a leg joint by checking against cached arrays
+                bool isConfirmedLeg = false;
+                if (HipJoints != null)
+                {
+                    for (int h = 0; h < HipJoints.Length; h++)
+                    {
+                        if (HipJoints[h] == joint) { isConfirmedLeg = true; break; }
+                    }
+                }
+                if (!isConfirmedLeg && KneeJoints != null)
+                {
+                    for (int k = 0; k < KneeJoints.Length; k++)
+                    {
+                        if (KneeJoints[k] == joint) { isConfirmedLeg = true; break; }
+                    }
+                }
+
                 JointDrive drive = joint.slerpDrive;
-                drive.positionSpring = 40f;
-                drive.positionDamper = 15f;
-                drive.maximumForce = 250f;
+                
+                if (isConfirmedLeg)
+                {
+                    // Stiffer legs - hold shape but still react to impacts
+                    drive.positionSpring = legSpring;
+                    drive.positionDamper = legDamper;
+                    drive.maximumForce = legMaxForce;
+                }
+                else
+                {
+                    // Loose upper body for natural ragdoll behavior
+                    drive.positionSpring = upperBodySpring;
+                    drive.positionDamper = upperBodyDamper;
+                    drive.maximumForce = upperBodyMaxForce;
+                }
+                
                 joint.slerpDrive = drive;
             }
         }
@@ -238,11 +287,28 @@ namespace PayneLab
                 !PayneLabUtils.IsFinite(rb.angularVelocity)) return;
 
             Vector2 rs = _mod.Input.RightStick;
+            Vector2 ls = _mod.Input.LeftStick;
 
+            // RS controls steering (yaw) and torso tilt (pitch)
+            // RS Left/Right: Yaw turn (spin around vertical axis)
+            // RS Up/Down: Torso tilt (nose dive or lean back)
+            float yawInput = rs.x;           // Left/Right steering
+            float pitchInput = rs.y;         // Forward/Back torso tilt
+            
+            // LS controls acrobatic flips and barrel rolls
+            // LS Up/Down: Front/Back flips (pitch rotation)
+            // LS Left/Right: Barrel rolls (roll rotation)
+            float flipInput = ls.y;          // Front/Back flips
+            float rollInput = ls.x;          // Barrel rolls
+
+            // Build desired angular velocity in local space
+            // X = pitch (flips + torso tilt), Y = yaw (steering), Z = roll (barrel rolls)
+            // RS torque is reduced (0.3f) to allow subtle steering/tilt without overpowering
+            // LS torque is full strength for aggressive flips and barrel rolls
             Vector3 desiredLocalAngVel = new Vector3(
-                rs.y * _mod.AerialFlipTorque,
-                0f,
-                -rs.x * _mod.AerialFlipTorque
+                (pitchInput * _mod.AerialFlipTorque * 0.3f) + (flipInput * _mod.AerialFlipTorque), // Pitch: RS for subtle tilt, LS for strong flips
+                yawInput * _mod.AerialFlipTorque * 0.5f,    // Yaw: RS steering (moderate strength)
+                -rollInput * _mod.AerialFlipTorque          // Roll: LS barrel rolls (full strength)
             );
 
             Vector3 currentLocalAngVel = rb.transform.InverseTransformDirection(rb.angularVelocity);
@@ -266,7 +332,9 @@ namespace PayneLab
 
             Vector2 ls = _mod.Input.LeftStick;
 
-            float desiredRollRate = Mathf.Abs(ls.x) > 0.15f ? (-ls.x * _mod.GroundRollTorque) : 0f;
+            // Barrel roll control: LS Left/Right initiates roll around forward axis
+            // Works in both grounded and aerial states for continuous corkscrew maneuvers
+            float desiredRollRate = Mathf.Abs(ls.x) > 0.1f ? (-ls.x * _mod.GroundRollTorque) : 0f;
             float currentRollRate = Vector3.Dot(rb.transform.InverseTransformDirection(rb.angularVelocity), Vector3.forward);
             float rollTorque = Mathf.Clamp((desiredRollRate - currentRollRate) * GroundRollTorqueGain,
                 -MaxGroundRollAngularAccel, MaxGroundRollAngularAccel);
